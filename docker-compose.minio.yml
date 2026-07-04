@@ -1,0 +1,40 @@
+# MinIO for wunderdrive integration tests.
+#
+# Run real-S3-semantics tests (versioning, multipart) against this with:
+#
+#     docker compose -f docker-compose.minio.yml up -d
+#     export WD_TEST_ENDPOINT=http://localhost:9000
+#     cargo test -p wunderdrive-engine --test minio -- --ignored --nocapture
+#     docker compose -f docker-compose.minio.yml down -v
+#
+# Bucket versioning is enabled via the MinIO server flag, so clobbered objects
+# remain recoverable — matching the spec's "bucket versioning on by default".
+
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: wunderdrive
+      MINIO_ROOT_PASSWORD: wunderdrive-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # One-shot bucket + versioning setup.
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 wunderdrive wunderdrive-secret &&
+      mc mb -p local/wunderdrive-test &&
+      mc version enable local/wunderdrive-test
+      "

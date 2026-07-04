@@ -1,0 +1,23 @@
+[package]
+name = "wunderdrive-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Terminal UI client for wunderdrive."
+
+[[bin]]
+name = "wunderdrive"
+path = "src/main.rs"
+
+[dependencies]
+wunderdrive-engine = { path = "../wunderdrive-engine" }
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json = "1"
+anyhow.workspace = true
+interprocess.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+dirs.workspace = true

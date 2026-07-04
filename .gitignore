@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+
+# local dev artifacts
+*.redb
+docker-compose.minio.override.yml
+
+# editor / OS
+.idea/
+.vscode/
+.DS_Store
