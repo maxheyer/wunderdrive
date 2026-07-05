@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::path::Path;
 use std::time::Duration;
 
 use iced::keyboard::{self, key::Named, Key};
@@ -49,7 +48,6 @@ struct Conn {
     last_error: Option<String>,
     expanded_conflict: Option<String>,
     selected: Option<String>,
-    preview: Option<(String, PreviewContent)>,
     view_mode: ViewMode,
     cursor: Option<usize>,
     first_snapshot: bool,
@@ -72,14 +70,6 @@ enum ViewMode {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum PreviewContent {
-    Text(String),
-    Binary,
-    Error(String),
-}
-
-#[derive(Debug, Clone)]
 pub enum Message {
     StatusFetched(Option<Status>, Option<String>),
     SnapshotFetched(Option<Snapshot>, Option<String>),
@@ -94,7 +84,6 @@ pub enum Message {
     ResolveConflict(String, Resolution),
     ToggleConflict(String),
     SelectFile(String),
-    PreviewLoaded(String, PreviewContent),
     FocusSearch,
     Navigate(Screen),
     Escape,
@@ -139,7 +128,6 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 last_error: None,
                 expanded_conflict: None,
                 selected: None,
-                preview: None,
                 view_mode: ViewMode::List,
                 cursor: None,
                 first_snapshot: true,
@@ -266,21 +254,7 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
         }
         Message::SelectFile(key) => {
             if let AppState::Connected(c) = &mut state.state {
-                c.selected = Some(key.clone());
-                c.preview = None;
-                if let Some(f) = c.snapshot.files.iter().find(|f| f.key == key) {
-                    if f.status != FileStatus::RemoteOnly && is_text_ext(&key) {
-                        return load_preview(c.status.local_root.clone(), key);
-                    }
-                }
-            }
-            Task::none()
-        }
-        Message::PreviewLoaded(key, content) => {
-            if let AppState::Connected(c) = &mut state.state {
-                if c.selected.as_deref() == Some(key.as_str()) {
-                    c.preview = Some((key, content));
-                }
+                c.selected = Some(key);
             }
             Task::none()
         }
@@ -1509,89 +1483,6 @@ fn status_glyph_icon(
         FileStatus::Conflict => (icons::alert_triangle, theme::SYNC_CONFLICT),
         FileStatus::RemoteOnly => (icons::cloud, theme::SYNC_REMOTE),
     }
-}
-
-fn is_text_ext(key: &str) -> bool {
-    const TEXT_EXTS: &[&str] = &[
-        "txt",
-        "md",
-        "markdown",
-        "rs",
-        "py",
-        "json",
-        "toml",
-        "yaml",
-        "yml",
-        "js",
-        "ts",
-        "tsx",
-        "jsx",
-        "sh",
-        "bash",
-        "zsh",
-        "c",
-        "h",
-        "cpp",
-        "hpp",
-        "cc",
-        "go",
-        "java",
-        "rb",
-        "css",
-        "scss",
-        "html",
-        "htm",
-        "xml",
-        "log",
-        "csv",
-        "tsv",
-        "ini",
-        "cfg",
-        "conf",
-        "sql",
-        "kt",
-        "swift",
-        "lua",
-        "vim",
-        "nf",
-        "env",
-        "gitignore",
-        "dockerfile",
-        "makefile",
-    ];
-    let lower = key.to_ascii_lowercase();
-    if let Some(name) = lower.rsplit('/').next() {
-        if let Some(dot) = name.rfind('.') {
-            return TEXT_EXTS.contains(&&name[dot + 1..]);
-        }
-        return matches!(name, "dockerfile" | "makefile" | ".gitignore");
-    }
-    false
-}
-
-fn load_preview(local_root: String, key: String) -> Task<Message> {
-    Task::perform(
-        async move {
-            let path = Path::new(&local_root).join(&key);
-            if !is_text_ext(&key) {
-                return (key, PreviewContent::Binary);
-            }
-            match tokio::fs::read(&path).await {
-                Ok(bytes) => {
-                    const CAP: usize = 256 * 1024;
-                    let truncated = bytes.len() > CAP;
-                    let slice = if truncated { &bytes[..CAP] } else { &bytes[..] };
-                    let mut s = String::from_utf8_lossy(slice).into_owned();
-                    if truncated {
-                        s.push_str("\n\n… (truncated)");
-                    }
-                    (key, PreviewContent::Text(s))
-                }
-                Err(e) => (key, PreviewContent::Error(e.to_string())),
-            }
-        },
-        |(key, content)| Message::PreviewLoaded(key, content),
-    )
 }
 
 fn short_date(mtime_millis: u64) -> String {
