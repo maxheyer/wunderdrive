@@ -348,12 +348,20 @@ pub fn conflict_edge_container(_theme: &Theme) -> container::Style {
 
 // ---- Text input style ----
 
-pub fn borderless_input(_theme: &Theme, _status: text_input::Status) -> text_input::Style {
+pub fn borderless_input(_theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let border_color = match status {
+        text_input::Status::Focused { .. } => ACCENT,
+        _ => Color::TRANSPARENT,
+    };
+    let border_width = match status {
+        text_input::Status::Focused { .. } => 2.0,
+        _ => 0.0,
+    };
     text_input::Style {
         background: Background::Color(Color::TRANSPARENT),
         border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
+            color: border_color,
+            width: border_width,
             radius: border::radius(0.0),
         },
         icon: TEXT_TERTIARY,

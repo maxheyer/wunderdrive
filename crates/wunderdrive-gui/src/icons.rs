@@ -26,6 +26,11 @@ macro_rules! icon_fn {
     };
 }
 
+/// Same as refresh_cw but with a rotation in radians (for animated sync glyph).
+pub fn refresh_cw_rotated(color: Color, radians: f32) -> svg::Svg<'static, iced::Theme> {
+    svg_icon(icon_handle!("refresh-cw"), color, 16.0).rotation(radians)
+}
+
 icon_fn!(folder, "folder");
 icon_fn!(file, "file");
 icon_fn!(file_text, "file-text");

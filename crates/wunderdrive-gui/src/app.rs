@@ -3,7 +3,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use iced::keyboard::{self, key::Named, Key};
-use iced::widget::{button, column, container, row, scrollable, space::Space, text, text_input};
+use iced::widget::{
+    button, column, container, row, scrollable, space::Space, stack, text, text_input,
+};
 use iced::{Alignment, Element, Length, Subscription, Task};
 use wunderdrive_engine::protocol::Resolution;
 use wunderdrive_engine::{ActivityEntry, FileStat, FileStatus, SearchHit, Snapshot, Status};
@@ -53,6 +55,14 @@ struct Conn {
     first_snapshot: bool,
     screen: Screen,
     activity: Vec<ActivityEntry>,
+    sync_phase: f32,
+    toast: Option<Toast>,
+}
+
+#[derive(Debug, Clone)]
+struct Toast {
+    message: String,
+    created_at: std::time::Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +104,7 @@ pub enum Message {
     ToggleViewMode,
     ActionResult(Result<(), String>),
     ActivityFetched(Vec<ActivityEntry>),
+    Tick,
     FontLoaded,
 }
 
@@ -111,7 +122,9 @@ pub fn new() -> (App, Task<Message>) {
 }
 
 pub fn subscription(_state: &App) -> Subscription<Message> {
-    keyboard::listen().filter_map(map_key)
+    let ticks = iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::Tick);
+    let keys = keyboard::listen().filter_map(map_key);
+    Subscription::batch(vec![ticks, keys])
 }
 
 pub fn update(state: &mut App, msg: Message) -> Task<Message> {
@@ -132,6 +145,8 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 first_snapshot: true,
                 screen: Screen::Files,
                 activity: Vec::new(),
+                sync_phase: 0.0,
+                toast: None,
             });
             poll_snapshot()
         }
@@ -355,13 +370,28 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
         Message::ActionResult(Err(e)) => {
             tracing::warn!("action failed: {e}");
             if let AppState::Connected(c) = &mut state.state {
-                c.last_error = Some(e);
+                c.last_error = Some(e.clone());
+                c.toast = Some(Toast {
+                    message: e,
+                    created_at: std::time::Instant::now(),
+                });
             }
             Task::none()
         }
         Message::ActivityFetched(entries) => {
             if let AppState::Connected(c) = &mut state.state {
                 c.activity = entries;
+            }
+            Task::none()
+        }
+        Message::Tick => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.sync_phase = (c.sync_phase + 0.1) % (std::f32::consts::TAU);
+                if let Some(t) = &c.toast {
+                    if t.created_at.elapsed() > std::time::Duration::from_secs(4) {
+                        c.toast = None;
+                    }
+                }
             }
             Task::none()
         }
@@ -393,10 +423,44 @@ pub fn view(state: &App) -> Element<'_, Message> {
 }
 
 fn main_layout(c: &Conn) -> Element<'_, Message> {
-    row![sidebar(c), content(c)]
+    let base: Element<'_, Message> = row![sidebar(c), content(c)]
         .width(Length::Fill)
         .height(Length::Fill)
-        .into()
+        .into();
+
+    if let Some(toast) = &c.toast {
+        let toast_layer = container(toast_view(&toast.message))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Bottom)
+            .padding(iced::Padding::new(0.0).bottom(24.0).right(24.0));
+
+        stack![base, toast_layer]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    } else {
+        base
+    }
+}
+
+fn toast_view(message: &str) -> Element<'static, Message> {
+    container(
+        row![
+            icons::alert_triangle(theme::SYNC_ERROR),
+            text(message.to_string())
+                .size(13)
+                .color(theme::TEXT_PRIMARY),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .padding([12, 16])
+    .style(theme::card_container)
+    .width(Length::Shrink)
+    .max_width(400)
+    .into()
 }
 
 // ---- Sidebar (design §3.4) ----
@@ -607,6 +671,8 @@ fn add_folder_button() -> Element<'static, Message> {
 
 /// Sync pill: dot + label, plus Sync-now / Pause icon-buttons.
 fn sync_pill(c: &Conn) -> Element<'_, Message> {
+    let is_syncing = !c.status.paused && c.status.last_sync_millis.is_none();
+
     let (dot_color, label) = if c.status.paused {
         (theme::SYNC_QUEUED, "Paused".to_string())
     } else if let Some(ms) = c.status.last_sync_millis {
@@ -628,8 +694,14 @@ fn sync_pill(c: &Conn) -> Element<'_, Message> {
         icons::pause(theme::TEXT_SECONDARY)
     };
 
+    let sync_icon = if is_syncing {
+        icons::refresh_cw_rotated(theme::SYNC_SYNCING, c.sync_phase)
+    } else {
+        icons::refresh_cw(theme::TEXT_SECONDARY)
+    };
+
     let controls = row![
-        button(icons::refresh_cw(theme::TEXT_SECONDARY))
+        button(sync_icon)
             .on_press(Message::SyncNow)
             .padding([4, 6])
             .style(theme::icon_button),
