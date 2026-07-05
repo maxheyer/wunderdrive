@@ -47,6 +47,9 @@ pub enum Error {
     #[error("notify (watch) error: {0}")]
     Notify(#[from] notify::Error),
 
+    #[error("search index (tantivy) error: {0}")]
+    Tantivy(#[from] tantivy::TantivyError),
+
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 

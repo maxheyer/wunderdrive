@@ -96,6 +96,12 @@ pub fn default_journal_path() -> PathBuf {
     base.join("wunderdrive").join("journal.redb")
 }
 
+/// Default Tantivy index directory (next to the journal).
+pub fn default_index_path() -> PathBuf {
+    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("wunderdrive").join("index")
+}
+
 /// Expand a leading `~` to the user's home directory.
 pub fn expand_tilde(p: &Path) -> PathBuf {
     let s = match p.to_str() {

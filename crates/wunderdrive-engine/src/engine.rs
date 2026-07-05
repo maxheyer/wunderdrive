@@ -19,9 +19,10 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep};
 use tracing::{debug, error, info};
 
-use crate::config::{default_journal_path, Config};
+use crate::config::{default_index_path, default_journal_path, Config};
 use crate::creds;
 use crate::error::{Error, Result};
+use crate::index::Indexer;
 use crate::journal::{self, key_for_local};
 use crate::mirror::{Mirror, SyncEvent};
 use crate::store;
@@ -91,6 +92,14 @@ enum Cmd {
     Shutdown,
 }
 
+/// A nudge to the indexer that something changed. Coalesces; the indexer just
+/// re-walks the journal and picks up cache misses.
+#[derive(Debug)]
+enum IndexCmd {
+    Trigger,
+    Shutdown,
+}
+
 /// Shared, lock-protected engine state (mutated by the loop, read by IPC).
 #[derive(Default)]
 struct State {
@@ -109,6 +118,7 @@ pub struct Engine {
     cfg: Config,
     db: Arc<Database>,
     mirror: Arc<Mirror>,
+    indexer: Option<Arc<Indexer>>,
     _loop: TokioMutex<Option<JoinHandle<()>>>,
 }
 
@@ -155,6 +165,22 @@ impl Engine {
         let state = Arc::new(State::default());
 
         let mirror = Arc::new(Mirror::new(cfg.clone(), obj_store, db.clone()));
+        let (index_tx, index_rx) = mpsc::channel::<IndexCmd>(64);
+
+        // Indexer is optional: a failure to open the Tantivy dir must not stop
+        // sync. The daemon still serves files; search just returns [].
+        let indexer = match Indexer::open(db.clone(), cfg.local_root.clone(), &default_index_path())
+        {
+            Ok(i) => Some(Arc::new(i)),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open search index; search disabled");
+                None
+            }
+        };
+        if let Some(ix) = indexer.clone() {
+            tokio::spawn(run_index_loop(ix, index_rx));
+        }
+
         let loop_state = state.clone();
         let loop_event_tx = event_tx.clone();
         let loop_cfg = cfg.clone();
@@ -165,6 +191,7 @@ impl Engine {
             cmd_rx,
             loop_event_tx,
             loop_state,
+            index_tx.clone(),
         ));
 
         Ok(Engine {
@@ -174,6 +201,7 @@ impl Engine {
             cfg,
             db,
             mirror,
+            indexer,
             _loop: TokioMutex::new(Some(handle)),
         })
     }
@@ -309,6 +337,24 @@ impl Engine {
             let _ = h.await;
         }
     }
+
+    /// Full-text search across the indexed corpus. Returns ranked hits with
+    /// snippets. Empty when the index is disabled or the query yields nothing.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<crate::SearchHit>> {
+        let Some(ix) = self.indexer.as_ref() else {
+            return Ok(Vec::new());
+        };
+        ix.search(query, limit)
+    }
+
+    /// Force an indexing sweep now (otherwise it runs after each sync pass).
+    /// Returns the number of newly-indexed keys, or 0 if indexing is disabled.
+    pub async fn index_now(&self) -> std::result::Result<usize, &'static str> {
+        let Some(ix) = self.indexer.as_ref() else {
+            return Ok(0);
+        };
+        ix.sweep().await.map_err(|_| "index sweep failed")
+    }
 }
 
 impl Drop for Engine {
@@ -325,6 +371,7 @@ async fn run_loop(
     mut cmd_rx: mpsc::Receiver<Cmd>,
     event_tx: broadcast::Sender<SyncEvent>,
     state: Arc<State>,
+    index_tx: mpsc::Sender<IndexCmd>,
 ) {
     // Watcher channel. We keep a sender (`watch_keepalive`) alive for the whole
     // loop so `recv()` blocks forever rather than returning `None` if the watcher
@@ -355,8 +402,12 @@ async fn run_loop(
                 biased;
 
                 Some(cmd) = cmd_rx.recv() => match cmd {
-                    Cmd::Shutdown => { info!("engine loop shutting down"); break; }
-                    Cmd::SyncNow => { run_sync(&mirror, &event_tx, &state).await; }
+                    Cmd::Shutdown => {
+                        info!("engine loop shutting down");
+                        let _ = index_tx.send(IndexCmd::Shutdown).await;
+                        break;
+                    }
+                    Cmd::SyncNow => { run_sync(&mirror, &event_tx, &state, &index_tx).await; }
                     Cmd::Pause => { state.paused.store(true, Ordering::Relaxed); info!("sync paused"); }
                     Cmd::Resume => { state.paused.store(false, Ordering::Relaxed); info!("sync resumed"); }
                 },
@@ -370,19 +421,19 @@ async fn run_loop(
                 _ = debounce.as_mut().unwrap() => {
                     debounce = None;
                     if !state.paused.load(Ordering::Relaxed) {
-                        run_sync(&mirror, &event_tx, &state).await;
+                        run_sync(&mirror, &event_tx, &state, &index_tx).await;
                     }
                 }
 
                 _ = remote_poll.tick() => {
                     if !state.paused.load(Ordering::Relaxed) {
-                        run_sync(&mirror, &event_tx, &state).await;
+                        run_sync(&mirror, &event_tx, &state, &index_tx).await;
                     }
                 }
 
                 _ = rescan.tick() => {
                     if !state.paused.load(Ordering::Relaxed) {
-                        run_sync(&mirror, &event_tx, &state).await;
+                        run_sync(&mirror, &event_tx, &state, &index_tx).await;
                     }
                 }
             }
@@ -392,8 +443,12 @@ async fn run_loop(
                 biased;
 
                 Some(cmd) = cmd_rx.recv() => match cmd {
-                    Cmd::Shutdown => { info!("engine loop shutting down"); break; }
-                    Cmd::SyncNow => { run_sync(&mirror, &event_tx, &state).await; }
+                    Cmd::Shutdown => {
+                        info!("engine loop shutting down");
+                        let _ = index_tx.send(IndexCmd::Shutdown).await;
+                        break;
+                    }
+                    Cmd::SyncNow => { run_sync(&mirror, &event_tx, &state, &index_tx).await; }
                     Cmd::Pause => { state.paused.store(true, Ordering::Relaxed); info!("sync paused"); }
                     Cmd::Resume => { state.paused.store(false, Ordering::Relaxed); info!("sync resumed"); }
                 },
@@ -405,13 +460,13 @@ async fn run_loop(
 
                 _ = remote_poll.tick() => {
                     if !state.paused.load(Ordering::Relaxed) {
-                        run_sync(&mirror, &event_tx, &state).await;
+                        run_sync(&mirror, &event_tx, &state, &index_tx).await;
                     }
                 }
 
                 _ = rescan.tick() => {
                     if !state.paused.load(Ordering::Relaxed) {
-                        run_sync(&mirror, &event_tx, &state).await;
+                        run_sync(&mirror, &event_tx, &state, &index_tx).await;
                     }
                 }
             }
@@ -419,11 +474,28 @@ async fn run_loop(
     }
 }
 
-/// Run one sync pass, forwarding events to the broadcast + activity log.
+/// Indexer task: waits for triggers, runs a sweep. Triggers coalesce — if a
+/// sweep is in flight, the next trigger queues behind it. Avoids touching the
+/// writer from the sync loop (which would block S3 I/O).
+async fn run_index_loop(indexer: Arc<Indexer>, mut rx: mpsc::Receiver<IndexCmd>) {
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            IndexCmd::Shutdown => break,
+            IndexCmd::Trigger => {
+                if let Err(e) = indexer.sweep().await {
+                    tracing::warn!(error = %e, "index sweep failed");
+                }
+            }
+        }
+    }
+}
+
+/// Run one sync pass, forward events, and nudge the indexer.
 async fn run_sync(
     mirror: &Arc<Mirror>,
     event_tx: &broadcast::Sender<SyncEvent>,
     state: &Arc<State>,
+    index_tx: &mpsc::Sender<IndexCmd>,
 ) {
     let (tx, mut rx) = mpsc::channel::<SyncEvent>(256);
     let forward_state = state.clone();
@@ -441,6 +513,8 @@ async fn run_sync(
     drop(tx);
     let _ = forwarder.await;
     *state.last_sync_millis.lock().unwrap() = Some(now_millis());
+    // Index sweep runs in its own task — fire-and-forget; coalesces if busy.
+    let _ = index_tx.try_send(IndexCmd::Trigger);
 }
 
 fn record_activity(state: &State, ev: &SyncEvent) {

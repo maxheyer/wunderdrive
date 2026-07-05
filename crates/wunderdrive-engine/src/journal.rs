@@ -19,6 +19,10 @@ use crate::error::Result;
 /// The single redb table: relative-key (UTF-8) → JSON [`JournalEntry`].
 const TABLE: TableDefinition<&str, &str> = TableDefinition::new("entries");
 
+/// Extraction cache: blake3-hex → extracted text. Keyed by content hash so
+/// rename / move / second-device is a free cache hit (spec §6).
+const EXTRACT_TABLE: TableDefinition<&str, &str> = TableDefinition::new("extracted");
+
 /// One row of the last-synced snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JournalEntry {
@@ -44,9 +48,12 @@ pub fn open(path: &Path) -> Result<Database> {
         std::fs::create_dir_all(parent)?;
     }
     let db = Database::create(path)?;
-    // Ensure the table exists.
+    // Ensure both tables exist.
     let txn = db.begin_write()?;
-    let _ = txn.open_table(TABLE)?;
+    {
+        let _ = txn.open_table(TABLE)?;
+        let _ = txn.open_table(EXTRACT_TABLE)?;
+    }
     txn.commit()?;
     Ok(db)
 }
@@ -142,6 +149,38 @@ pub fn mtime_millis(path: &Path) -> Result<u64> {
         .unwrap_or(0))
 }
 
+// Extraction cache ---------------------------------------------------------
+
+/// Look up extracted text by blake3 hash. `Ok(None)` = cache miss.
+pub fn extract_get(db: &Database, hash: &[u8; 32]) -> Result<Option<String>> {
+    let key = crate::hash::to_hex(hash);
+    let read = db.begin_read()?;
+    let table = read.open_table(EXTRACT_TABLE)?;
+    Ok(table.get(key.as_str())?.map(|v| v.value().to_string()))
+}
+
+/// Some files have no extractable text (images, scans we didn't OCR yet). We
+/// record an empty string so the sweep doesn't keep retrying — `extract_get`
+/// then surfaces `Some("")`. [`extract_has`] tells the two apart.
+pub fn extract_put(db: &Database, hash: &[u8; 32], text: &str) -> Result<()> {
+    let key = crate::hash::to_hex(hash);
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(EXTRACT_TABLE)?;
+        table.insert(key.as_str(), text)?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// True if a hash is in the cache at all (hit or "no text" sentinel).
+pub fn extract_has(db: &Database, hash: &[u8; 32]) -> Result<bool> {
+    let key = crate::hash::to_hex(hash);
+    let read = db.begin_read()?;
+    let table = read.open_table(EXTRACT_TABLE)?;
+    Ok(table.get(key.as_str())?.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +210,17 @@ mod tests {
         let key = key_for_local(root, &lp).unwrap();
         assert_eq!(key, "sub/a.txt");
         assert_eq!(local_for_key(root, &key), lp);
+    }
+
+    #[test]
+    fn extract_cache_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir.path().join("j.redb")).unwrap();
+        let h = [7u8; 32];
+        assert!(extract_get(&db, &h).unwrap().is_none());
+        assert!(!extract_has(&db, &h).unwrap());
+        extract_put(&db, &h, "hello").unwrap();
+        assert!(extract_has(&db, &h).unwrap());
+        assert_eq!(extract_get(&db, &h).unwrap().as_deref(), Some("hello"));
     }
 }

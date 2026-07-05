@@ -10,7 +10,9 @@ pub mod config;
 pub mod creds;
 pub mod engine;
 pub mod error;
+pub mod extract;
 pub mod hash;
+pub mod index;
 pub mod journal;
 pub mod mirror;
 pub mod protocol;
@@ -20,3 +22,4 @@ pub mod watch;
 
 pub use engine::{ActivityEntry, Engine, FileStat, FileStatus, Snapshot, Status};
 pub use error::{Error, Result};
+pub use index::SearchHit;

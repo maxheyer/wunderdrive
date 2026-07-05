@@ -29,12 +29,13 @@ use ratatui::Terminal;
 use tokio::io::BufStream;
 use tokio::time::interval;
 use wunderdrive_engine::protocol::{
-    read_msg, write_msg, Request, Resolution, Response, METHOD_ACTIVITY, METHOD_PAUSE,
-    METHOD_RESOLVE_CONFLICT, METHOD_RESUME, METHOD_SNAPSHOT, METHOD_STATUS, METHOD_SYNC_NOW,
+    read_msg, write_msg, Request, Resolution, Response, METHOD_ACTIVITY, METHOD_INDEX_NOW,
+    METHOD_PAUSE, METHOD_RESOLVE_CONFLICT, METHOD_RESUME, METHOD_SEARCH, METHOD_SNAPSHOT,
+    METHOD_STATUS, METHOD_SYNC_NOW,
 };
-use wunderdrive_engine::{ActivityEntry, FileStatus, Snapshot, Status};
+use wunderdrive_engine::{ActivityEntry, FileStatus, SearchHit, Snapshot, Status};
 
-const TABS: [&str; 3] = ["Files", "Conflicts", "Activity"];
+const TABS: [&str; 4] = ["Files", "Conflicts", "Activity", "Search"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,6 +63,8 @@ async fn main() -> Result<()> {
         conflicts: Vec::new(),
         tab: 0,
         list: ListState::default(),
+        search_query: String::new(),
+        search_results: Vec::new(),
         last_error: None,
     };
     app.refresh_conflicts();
@@ -79,6 +82,8 @@ struct App {
     conflicts: Vec<String>,
     tab: usize,
     list: ListState,
+    search_query: String,
+    search_results: Vec<SearchHit>,
     last_error: Option<String>,
 }
 
@@ -100,7 +105,8 @@ impl App {
         let len = match self.tab {
             0 => self.snapshot.files.len(),
             1 => self.conflicts.len(),
-            _ => self.activity.len(),
+            2 => self.activity.len(),
+            _ => self.search_results.len(),
         };
         if len == 0 {
             self.list.select(None);
@@ -115,6 +121,14 @@ impl App {
             next = 0;
         }
         self.list.select(Some(next as usize));
+    }
+
+    /// In search tab, the input is always focused unless the user has cleared
+    /// the query and run a search that returned nothing (ambiguous), so keep it
+    /// simple: focused whenever we're on tab 3 and have either a query or no
+    /// results to navigate.
+    fn search_input_focused(&self) -> bool {
+        self.tab == 3 && (self.search_query.is_empty() || self.search_results.is_empty())
     }
 }
 
@@ -184,6 +198,19 @@ impl Client {
             .await?;
         Ok(())
     }
+    async fn search(&mut self, query: &str) -> Result<Vec<SearchHit>> {
+        let r = self
+            .call(
+                METHOD_SEARCH,
+                serde_json::json!({ "query": query, "limit": 100 }),
+            )
+            .await?;
+        parse(r)
+    }
+    async fn index_now(&mut self) -> Result<()> {
+        let _ = self.call(METHOD_INDEX_NOW, serde_json::Value::Null).await?;
+        Ok(())
+    }
 }
 
 fn parse<T: serde::de::DeserializeOwned>(r: Response) -> Result<T> {
@@ -233,13 +260,57 @@ async fn handle_event(app: &mut App, client: &mut Client, ev: Event) -> Result<b
         if k.kind != KeyEventKind::Press {
             return Ok(true);
         }
+
+        // Search input captures all keys first; only Esc/Backspace/Enter/Up/Down
+        // are interpreted as controls.
+        if app.tab == 3 && app.search_input_focused() {
+            match k.code {
+                KeyCode::Esc => {
+                    app.search_query.clear();
+                    app.search_results.clear();
+                    app.list.select(None);
+                }
+                KeyCode::Enter => {
+                    if app.search_query.trim().is_empty() {
+                        app.search_results.clear();
+                    } else {
+                        match client.search(&app.search_query).await {
+                            Ok(hits) => {
+                                app.search_results = hits;
+                                app.list.select(if app.search_results.is_empty() {
+                                    None
+                                } else {
+                                    Some(0)
+                                });
+                                app.last_error = None;
+                            }
+                            Err(e) => app.last_error = Some(e.to_string()),
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    app.search_query.pop();
+                }
+                KeyCode::Down | KeyCode::Char('j') => app.move_sel(1),
+                KeyCode::Up | KeyCode::Char('k') => app.move_sel(-1),
+                KeyCode::Char(c) => app.search_query.push(c),
+                _ => {}
+            }
+            return Ok(true);
+        }
+
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
             KeyCode::Char('1') => app.tab = 0,
             KeyCode::Char('2') => app.tab = 1,
             KeyCode::Char('3') => app.tab = 2,
+            KeyCode::Char('4') => app.tab = 3,
             KeyCode::Tab => app.tab = (app.tab + 1) % TABS.len(),
             KeyCode::BackTab => app.tab = (app.tab + TABS.len() - 1) % TABS.len(),
+            KeyCode::Char('/') => {
+                app.tab = 3;
+                app.list.select(None);
+            }
             KeyCode::Down | KeyCode::Char('j') => app.move_sel(1),
             KeyCode::Up | KeyCode::Char('k') => app.move_sel(-1),
             KeyCode::Char('r') => match client.sync_now().await {
@@ -256,6 +327,10 @@ async fn handle_event(app: &mut App, client: &mut Client, ev: Event) -> Result<b
                     app.last_error = Some(e.to_string());
                 }
             }
+            KeyCode::Char('i') => match client.index_now().await {
+                Ok(_) => app.last_error = None,
+                Err(e) => app.last_error = Some(e.to_string()),
+            },
             KeyCode::Char('l') => {
                 if app.tab == 1 {
                     if let Some(key) = app.conflicts.get(app.list.selected().unwrap_or(0)).cloned()
@@ -324,15 +399,19 @@ mod ui {
         match app.tab {
             0 => draw_files(f, app, chunks[1]),
             1 => draw_conflicts(f, app, chunks[1]),
-            _ => draw_activity(f, app, chunks[1]),
+            2 => draw_activity(f, app, chunks[1]),
+            _ => draw_search(f, app, chunks[1]),
         }
 
         let mut help = format!(
-            " [1/2/3] tabs  ↑↓ move  [r] sync-now  [p] {pause}  [q] quit",
+            " [1-4] tabs  ↑↓ move  [r] sync-now  [i] index-now  [p] {pause}  [/] search  [q] quit",
             pause = if app.status.paused { "resume" } else { "pause" }
         );
         if app.tab == 1 {
             help.push_str("  [l] keep-local  [o] keep-remote  [b] keep-both");
+        }
+        if app.tab == 3 {
+            help.push_str("  [enter] run  [esc] clear");
         }
         if let Some(e) = &app.last_error {
             help.push_str(&format!("   ⚠ {e}"));
@@ -412,6 +491,62 @@ mod ui {
         f.render_widget(list, area);
     }
 
+    /// Search tab: input box at top, ranked results below with HTML-stripped
+    /// snippets. Tantivy's snippet generator emits `<mark>…</mark>` tags; we
+    /// strip them for the terminal (no rich highlighting yet).
+    fn draw_search(f: &mut ratatui::Frame<'_>, app: &mut App, area: ratatui::layout::Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(1)])
+            .split(area);
+
+        let prompt = if app.search_query.is_empty() {
+            "/ ".to_string()
+        } else {
+            format!("/ {}", app.search_query)
+        };
+        let cursor = if app.search_input_focused() { "_" } else { "" };
+        let input = Paragraph::new(format!("{prompt}{cursor}"))
+            .block(Block::default().borders(Borders::ALL).title(" Search "));
+        f.render_widget(input, chunks[0]);
+
+        let items: Vec<ListItem> = if app.search_results.is_empty() {
+            if app.search_query.is_empty() {
+                vec![ListItem::new(Line::from(
+                    " Type a query and press Enter. Press [i] to (re)index now.",
+                ))]
+            } else {
+                vec![ListItem::new(Line::from(" No matches."))]
+            }
+        } else {
+            app.search_results
+                .iter()
+                .map(|h| {
+                    let key = Line::from(vec![
+                        Span::styled("› ", Style::default().fg(Color::Cyan)),
+                        Span::raw(h.key.clone()),
+                    ]);
+                    let mut lines = vec![key];
+                    if let Some(snip) = &h.snippet {
+                        if !snip.is_empty() {
+                            let plain = strip_html(snip);
+                            lines.push(Line::from(format!("  {}", truncate_str(&plain, 120))));
+                        }
+                    }
+                    ListItem::new(lines)
+                })
+                .collect()
+        };
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" Results ({}) ", app.search_results.len())),
+            )
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        f.render_stateful_widget(list, chunks[1], &mut app.list);
+    }
+
     fn human_size(n: u64) -> String {
         const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
         let mut f = n as f64;
@@ -425,6 +560,29 @@ mod ui {
         } else {
             format!("{:.1} {}", f, UNITS[i])
         }
+    }
+
+    /// Strip the `<mark>…</mark>` tags Tantivy's snippet generator emits; we
+    /// don't render rich highlighting in the terminal yet.
+    fn strip_html(s: &str) -> String {
+        s.replace("<mark>", "").replace("</mark>", "")
+    }
+
+    /// Truncate to `max` chars on a word boundary, appending "…".
+    fn truncate_str(s: &str, max: usize) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() <= max {
+            return s.to_string();
+        }
+        let mut end = max.saturating_sub(1);
+        while end > 0 && !chars[end].is_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            end = max.saturating_sub(1);
+        }
+        let head: String = chars[..end].iter().collect();
+        format!("{head}…")
     }
 }
 

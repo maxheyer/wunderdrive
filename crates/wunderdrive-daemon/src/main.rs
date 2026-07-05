@@ -16,8 +16,9 @@ use tokio::io::BufStream;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 use wunderdrive_engine::protocol::{
-    read_msg, write_msg, Request, Resolution, Response, METHOD_ACTIVITY, METHOD_PAUSE,
-    METHOD_RESOLVE_CONFLICT, METHOD_RESUME, METHOD_SNAPSHOT, METHOD_STATUS, METHOD_SYNC_NOW,
+    read_msg, write_msg, Request, Resolution, Response, METHOD_ACTIVITY, METHOD_INDEX_NOW,
+    METHOD_PAUSE, METHOD_RESOLVE_CONFLICT, METHOD_RESUME, METHOD_SEARCH, METHOD_SNAPSHOT,
+    METHOD_STATUS, METHOD_SYNC_NOW,
 };
 use wunderdrive_engine::Engine;
 
@@ -167,6 +168,29 @@ async fn dispatch(
             let _g = cmd_lock.lock().await;
             match engine.resolve_conflict(&key, resolution).await {
                 Ok(_) => Response::ok(id, serde_json::Value::Null),
+                Err(e) => err(e.to_string()),
+            }
+        }
+        METHOD_SEARCH => {
+            let query = match req.params.get("query").and_then(|v| v.as_str()) {
+                Some(q) => q.to_string(),
+                None => return err("missing 'query'".into()),
+            };
+            let limit = req
+                .params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50) as usize;
+            // Search is a pure local read — no cmd_lock needed.
+            match engine.search(&query, limit) {
+                Ok(hits) => Response::ok(id, serde_json::to_value(hits).unwrap()),
+                Err(e) => err(e.to_string()),
+            }
+        }
+        METHOD_INDEX_NOW => {
+            let _g = cmd_lock.lock().await;
+            match engine.index_now().await {
+                Ok(n) => Response::ok(id, serde_json::json!({ "indexed": n })),
                 Err(e) => err(e.to_string()),
             }
         }
