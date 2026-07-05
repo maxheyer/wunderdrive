@@ -71,6 +71,11 @@ pub const METHOD_RESOLVE_CONFLICT: &str = "resolve_conflict";
 pub const METHOD_SEARCH: &str = "search";
 pub const METHOD_INDEX_NOW: &str = "index_now";
 pub const METHOD_MATERIALIZE: &str = "materialize";
+pub const METHOD_UNLOCK_KEY: &str = "unlock_key";
+pub const METHOD_RESTORE_VERSION: &str = "restore_version";
+pub const METHOD_PIN_VERSION: &str = "pin_version";
+pub const METHOD_UNPIN_VERSION: &str = "unpin_version";
+pub const METHOD_VERSION_HISTORY: &str = "version_history";
 
 // Framing ------------------------------------------------------------------
 

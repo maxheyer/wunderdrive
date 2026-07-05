@@ -7,7 +7,7 @@
 //! already stripped by [`PrefixStore`](object_store::prefix::PrefixStore)).
 //! `local_path` and `s3_key` are derived deterministically from this key.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,6 +33,28 @@ const STUB_TABLE: TableDefinition<&str, &str> = TableDefinition::new("stubs");
 /// orphans (key here but not in the journal) get deleted; renames (new key,
 /// same hash) re-insert from the extraction cache without re-parsing.
 const INDEXED_TABLE: TableDefinition<&str, &str> = TableDefinition::new("indexed");
+
+/// Object-Lock-aware keys: relative-key → empty marker. Populated when an
+/// upload or delete fails with S3 `PermissionDenied` (Object Lock retention).
+/// Reconcile skips keys in this set so we don't retry forever. Cleared by
+/// [`lock_clear`] when the user explicitly retries.
+const LOCK_TABLE: TableDefinition<&str, &str> = TableDefinition::new("locked");
+
+/// Sync metadata: singleton key → JSON value. Stores the last-seen remote key
+/// (for incremental listing offset) and the sync counter (to schedule periodic
+/// full listings that catch deletes).
+const META_TABLE: TableDefinition<&str, &str> = TableDefinition::new("meta");
+
+/// Version history: relative-key → JSON `Vec<VersionEntry>`. Tracks the
+/// version IDs seen for each key during remote listings, so the user can
+/// restore to a known-good version without S3's ListObjectVersions API
+/// (which object_store 0.14 doesn't expose).
+const VERSION_TABLE: TableDefinition<&str, &str> = TableDefinition::new("versions");
+
+/// Pinned versions: relative-key → version-id string. When a key is pinned,
+/// downloads/materialize fetch the specific version instead of HEAD, and
+/// reconcile does not overwrite it.
+const PIN_TABLE: TableDefinition<&str, &str> = TableDefinition::new("pinned");
 
 /// Metadata for a remote-only object (lazy-download stub).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,6 +95,10 @@ pub fn open(path: &Path) -> Result<Database> {
         let _ = txn.open_table(EXTRACT_TABLE)?;
         let _ = txn.open_table(STUB_TABLE)?;
         let _ = txn.open_table(INDEXED_TABLE)?;
+        let _ = txn.open_table(LOCK_TABLE)?;
+        let _ = txn.open_table(META_TABLE)?;
+        let _ = txn.open_table(VERSION_TABLE)?;
+        let _ = txn.open_table(PIN_TABLE)?;
     }
     txn.commit()?;
     Ok(db)
@@ -283,6 +309,167 @@ pub fn indexed_remove(db: &Database, key: &str) -> Result<()> {
     Ok(())
 }
 
+// Object-Lock-aware keys ---------------------------------------------------
+
+/// Read all locked keys into a set. Reconcile skips these so we don't retry
+/// forever on objects under S3 Object Lock retention.
+pub fn lock_list(db: &Database) -> Result<HashSet<String>> {
+    let read = db.begin_read()?;
+    let table = read.open_table(LOCK_TABLE)?;
+    let mut out = HashSet::new();
+    for row in table.iter()? {
+        let (k, _) = row?;
+        out.insert(k.value().to_string());
+    }
+    Ok(out)
+}
+
+/// Mark a key as locked (e.g. S3 returned PermissionDenied on overwrite/delete).
+pub fn lock_add(db: &Database, key: &str) -> Result<()> {
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(LOCK_TABLE)?;
+        table.insert(key, "")?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// Remove a key from the locked set (e.g. user explicitly retries).
+pub fn lock_clear(db: &Database, key: &str) -> Result<()> {
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(LOCK_TABLE)?;
+        table.remove(key)?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+// Sync metadata (incremental listing state) --------------------------------
+
+/// Incremental-listing metadata key (singleton row in META_TABLE).
+const META_KEY: &str = "sync";
+
+/// Incremental-listing state persisted between syncs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SyncMeta {
+    /// The last key seen in the most recent remote listing. Used as the
+    /// `start-after` offset for S3's incremental listing.
+    pub last_remote_key: Option<String>,
+    /// Monotonic sync counter. Used to schedule periodic full listings
+    /// (every `full_list_interval` syncs) so deletes are caught.
+    pub sync_count: u64,
+}
+
+/// Read the sync metadata, or `Default` if not yet set.
+pub fn meta_get(db: &Database) -> Result<SyncMeta> {
+    let read = db.begin_read()?;
+    let table = read.open_table(META_TABLE)?;
+    if let Some(v) = table.get(META_KEY)? {
+        let meta: SyncMeta = serde_json::from_str(v.value())
+            .map_err(|e| crate::Error::other(format!("meta decode: {e}")))?;
+        return Ok(meta);
+    }
+    Ok(SyncMeta::default())
+}
+
+/// Write the sync metadata.
+pub fn meta_put(db: &Database, meta: &SyncMeta) -> Result<()> {
+    let json = serde_json::to_string(meta)
+        .map_err(|e| crate::Error::other(format!("meta encode: {e}")))?;
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(META_TABLE)?;
+        table.insert(META_KEY, json.as_str())?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+// Version history ----------------------------------------------------------
+
+/// A version observed for a key during a remote listing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionEntry {
+    pub version_id: String,
+    /// When this version was first observed (epoch millis).
+    pub seen_millis: u64,
+    /// Object size at that version.
+    pub size: u64,
+}
+
+const MAX_VERSIONS_PER_KEY: usize = 20;
+
+/// Record that a version was seen for `key`. Maintains a bounded history
+/// (most recent `MAX_VERSIONS_PER_KEY` entries). No-op if the version is
+/// already recorded.
+pub fn version_add(db: &Database, key: &str, entry: &VersionEntry) -> Result<()> {
+    let mut history = version_list(db, key)?.unwrap_or_default();
+    if history.iter().any(|v| v.version_id == entry.version_id) {
+        return Ok(());
+    }
+    history.push(entry.clone());
+    // Keep only the most recent entries (trim oldest).
+    if history.len() > MAX_VERSIONS_PER_KEY {
+        let start = history.len() - MAX_VERSIONS_PER_KEY;
+        history.drain(0..start);
+    }
+    let json = serde_json::to_string(&history)
+        .map_err(|e| crate::Error::other(format!("version encode: {e}")))?;
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(VERSION_TABLE)?;
+        table.insert(key, json.as_str())?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// Read the version history for `key`. Returns `None` if no history recorded.
+pub fn version_list(db: &Database, key: &str) -> Result<Option<Vec<VersionEntry>>> {
+    let read = db.begin_read()?;
+    let table = read.open_table(VERSION_TABLE)?;
+    if let Some(v) = table.get(key)? {
+        let history: Vec<VersionEntry> = serde_json::from_str(v.value())
+            .map_err(|e| crate::Error::other(format!("version decode {key}: {e}")))?;
+        return Ok(Some(history));
+    }
+    Ok(None)
+}
+
+/// Pinned versions ---------------------------------------------------------
+
+/// Pin a specific version for `key`. Subsequent downloads/materialize fetch
+/// this version instead of HEAD.
+pub fn pin_set(db: &Database, key: &str, version_id: &str) -> Result<()> {
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(PIN_TABLE)?;
+        table.insert(key, version_id)?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// Get the pinned version for `key`, if any.
+pub fn pin_get(db: &Database, key: &str) -> Result<Option<String>> {
+    let read = db.begin_read()?;
+    let table = read.open_table(PIN_TABLE)?;
+    Ok(table.get(key)?.map(|v| v.value().to_string()))
+}
+
+/// Remove the pin for `key`.
+pub fn pin_clear(db: &Database, key: &str) -> Result<()> {
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(PIN_TABLE)?;
+        table.remove(key)?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
 /// Clear the entire extraction cache. Used by [`Indexer::rebuild`] to force
 /// re-extraction on the next sweep.
 pub fn extract_clear(db: &Database) -> Result<()> {
@@ -377,5 +564,102 @@ mod tests {
         assert_eq!(map.get("a.txt"), Some(&h));
         indexed_remove(&db, "a.txt").unwrap();
         assert!(indexed_list(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lock_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir.path().join("j.redb")).unwrap();
+        assert!(lock_list(&db).unwrap().is_empty());
+        lock_add(&db, "locked-file.pdf").unwrap();
+        lock_add(&db, "other.docx").unwrap();
+        let set = lock_list(&db).unwrap();
+        assert!(set.contains("locked-file.pdf"));
+        assert!(set.contains("other.docx"));
+        lock_clear(&db, "locked-file.pdf").unwrap();
+        let set = lock_list(&db).unwrap();
+        assert!(!set.contains("locked-file.pdf"));
+        assert!(set.contains("other.docx"));
+    }
+
+    #[test]
+    fn meta_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir.path().join("j.redb")).unwrap();
+        // Default when empty.
+        let m = meta_get(&db).unwrap();
+        assert_eq!(m.sync_count, 0);
+        assert!(m.last_remote_key.is_none());
+        // Round-trip.
+        let m = SyncMeta {
+            last_remote_key: Some("zzzz.txt".into()),
+            sync_count: 42,
+        };
+        meta_put(&db, &m).unwrap();
+        let loaded = meta_get(&db).unwrap();
+        assert_eq!(loaded.sync_count, 42);
+        assert_eq!(loaded.last_remote_key.as_deref(), Some("zzzz.txt"));
+    }
+
+    #[test]
+    fn version_history_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir.path().join("j.redb")).unwrap();
+        assert!(version_list(&db, "a.txt").unwrap().is_none());
+
+        let v1 = VersionEntry {
+            version_id: "v1".into(),
+            seen_millis: 100,
+            size: 42,
+        };
+        version_add(&db, "a.txt", &v1).unwrap();
+        // Adding the same version is a no-op.
+        version_add(&db, "a.txt", &v1).unwrap();
+
+        let v2 = VersionEntry {
+            version_id: "v2".into(),
+            seen_millis: 200,
+            size: 50,
+        };
+        version_add(&db, "a.txt", &v2).unwrap();
+
+        let history = version_list(&db, "a.txt").unwrap().unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().any(|v| v.version_id == "v1"));
+        assert!(history.iter().any(|v| v.version_id == "v2"));
+    }
+
+    #[test]
+    fn version_history_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir.path().join("j.redb")).unwrap();
+        for i in 0..(MAX_VERSIONS_PER_KEY + 5) {
+            version_add(
+                &db,
+                "big.txt",
+                &VersionEntry {
+                    version_id: format!("v{i}"),
+                    seen_millis: i as u64,
+                    size: i as u64,
+                },
+            )
+            .unwrap();
+        }
+        let history = version_list(&db, "big.txt").unwrap().unwrap();
+        assert_eq!(history.len(), MAX_VERSIONS_PER_KEY);
+        // Oldest entries were trimmed.
+        assert!(!history.iter().any(|v| v.version_id == "v0"));
+        assert!(history.iter().any(|v| v.version_id == "v24"));
+    }
+
+    #[test]
+    fn pin_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir.path().join("j.redb")).unwrap();
+        assert!(pin_get(&db, "a.txt").unwrap().is_none());
+        pin_set(&db, "a.txt", "ver-123").unwrap();
+        assert_eq!(pin_get(&db, "a.txt").unwrap().as_deref(), Some("ver-123"));
+        pin_clear(&db, "a.txt").unwrap();
+        assert!(pin_get(&db, "a.txt").unwrap().is_none());
     }
 }

@@ -15,6 +15,7 @@ pub mod hash;
 pub mod index;
 pub mod journal;
 pub mod mirror;
+pub mod ocr;
 pub mod protocol;
 pub mod reconcile;
 pub mod store;
@@ -22,4 +23,6 @@ pub mod watch;
 
 pub use engine::{ActivityEntry, Engine, FileStat, FileStatus, Snapshot, Status};
 pub use error::{Error, Result};
+pub use extract::OcrEngine;
 pub use index::SearchHit;
+pub use ocr::OcrsEngine;

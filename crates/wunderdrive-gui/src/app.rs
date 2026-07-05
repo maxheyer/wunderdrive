@@ -239,6 +239,9 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 if q.trim().is_empty() {
                     return Task::none();
                 }
+                // Switch to the search screen so results are visible
+                // regardless of which screen the user was on.
+                c.screen = Screen::Search;
                 run_search(q)
             } else {
                 Task::none()

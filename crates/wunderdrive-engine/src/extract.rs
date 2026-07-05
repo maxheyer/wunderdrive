@@ -553,4 +553,177 @@ mod tests {
         let t = truncate_chars(s, 2);
         assert_eq!(t, "hé");
     }
+
+    // --- real binary-format fixtures (built in-memory) ---
+
+    /// Build a minimal valid xlsx (zip of XML parts) recognizable by calamine.
+    /// Two shared strings ("Name", "Alice") + one numeric cell (42).
+    fn build_minimal_xlsx() -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+        let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default();
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+</Types>"#;
+        let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#;
+        let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#;
+        let workbook_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+</Relationships>"#;
+        let shared_strings = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="2" uniqueCount="2">
+<si><t>Name</t></si>
+<si><t>Alice</t></si>
+</sst>"#;
+        let sheet1 = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>
+<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
+<row r="2"><c r="A2"><v>42</v></c></row>
+</sheetData>
+</worksheet>"#;
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(content_types.as_bytes()).unwrap();
+        zw.start_file("_rels/.rels", opts).unwrap();
+        zw.write_all(rels.as_bytes()).unwrap();
+        zw.start_file("xl/workbook.xml", opts).unwrap();
+        zw.write_all(workbook.as_bytes()).unwrap();
+        zw.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+        zw.write_all(workbook_rels.as_bytes()).unwrap();
+        zw.start_file("xl/sharedStrings.xml", opts).unwrap();
+        zw.write_all(shared_strings.as_bytes()).unwrap();
+        zw.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+        zw.write_all(sheet1.as_bytes()).unwrap();
+        let cursor = zw.finish().unwrap();
+        cursor.into_inner()
+    }
+
+    /// Build a minimal valid docx (zip of XML parts) recognizable by the
+    /// OOXML text extractor. Contains "Hello docx world" in a w:t element.
+    fn build_minimal_docx() -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+        let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default();
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+        let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+        let document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body><w:p><w:r><w:t>Hello docx world</w:t></w:r></w:p></w:body></w:document>"#;
+        zw.start_file("[Content_Types].xml", opts).unwrap();
+        zw.write_all(content_types.as_bytes()).unwrap();
+        zw.start_file("_rels/.rels", opts).unwrap();
+        zw.write_all(rels.as_bytes()).unwrap();
+        zw.start_file("word/document.xml", opts).unwrap();
+        zw.write_all(document.as_bytes()).unwrap();
+        let cursor = zw.finish().unwrap();
+        cursor.into_inner()
+    }
+
+    /// Build a minimal valid PDF with one page containing "(Hello PDF) Tj".
+    /// Computes xref offsets dynamically so lopdf can parse it cleanly.
+    fn build_minimal_pdf() -> Vec<u8> {
+        let stream_body = b"(Hello PDF) Tj\n";
+        let stream_len = stream_body.len();
+
+        let header = b"%PDF-1.4\n";
+        let obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+        let obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n";
+        let obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n";
+        let stream_pre = format!("4 0 obj\n<< /Length {stream_len} >>\nstream\n").into_bytes();
+        let stream_post = b"endstream\nendobj\n";
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(header);
+        let off1 = bytes.len();
+        bytes.extend_from_slice(obj1);
+        let off2 = bytes.len();
+        bytes.extend_from_slice(obj2);
+        let off3 = bytes.len();
+        bytes.extend_from_slice(obj3);
+        let off4 = bytes.len();
+        bytes.extend_from_slice(&stream_pre);
+        bytes.extend_from_slice(stream_body);
+        bytes.extend_from_slice(stream_post);
+
+        let xref_offset = bytes.len();
+        // lopdf's xref entry parser accepts only " \r", " \n", or "\r\n" as
+        // the line terminator — NOT " \r\n" (the spec's 20-byte form). Use
+        // " \n" (space + LF) to stay within the accepted set.
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n"
+        );
+        bytes.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n");
+        bytes.extend_from_slice(trailer.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn xlsx_extracts_cell_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data.xlsx");
+        std::fs::write(&p, build_minimal_xlsx()).unwrap();
+        let out = extract_text(&p)
+            .unwrap()
+            .expect("xlsx should extract Some(text)");
+        assert!(out.contains("Name"), "missing 'Name' in: {out:?}");
+        assert!(out.contains("Alice"), "missing 'Alice' in: {out:?}");
+        assert!(out.contains("42"), "missing '42' in: {out:?}");
+    }
+
+    #[test]
+    fn docx_extracts_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("doc.docx");
+        std::fs::write(&p, build_minimal_docx()).unwrap();
+        let out = extract_text(&p)
+            .unwrap()
+            .expect("docx should extract Some(text)");
+        assert!(
+            out.contains("Hello docx world"),
+            "missing phrase in: {out:?}"
+        );
+    }
+
+    #[test]
+    fn pdf_extracts_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("doc.pdf");
+        std::fs::write(&p, build_minimal_pdf()).unwrap();
+        let out = extract_text(&p)
+            .unwrap()
+            .expect("pdf should extract Some(text)");
+        assert!(out.contains("Hello PDF"), "missing 'Hello PDF' in: {out:?}");
+    }
 }

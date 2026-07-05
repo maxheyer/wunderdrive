@@ -28,6 +28,9 @@ lopdf.workspace = true
 calamine.workspace = true
 zip.workspace = true
 quick-xml.workspace = true
+ocrs.workspace = true
+rten.workspace = true
+image.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

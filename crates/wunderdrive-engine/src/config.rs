@@ -98,6 +98,18 @@ pub fn default_config_path() -> PathBuf {
     base.join("wunderdrive").join("config.toml")
 }
 
+/// Default credentials file location (headless fallback).
+///
+/// Sits next to `config.toml` and holds S3 access keys for headless
+/// deployments where no OS keychain is available (NixOS sandboxes, CI,
+/// containers, headless servers). The file must be mode 0600;
+/// [`crate::creds::load_from_file`] enforces this on read. See
+/// [`crate::creds`] for the resolution chain.
+pub fn default_credentials_path() -> PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("wunderdrive").join("credentials.toml")
+}
+
 /// Default journal location (next to config, in cache dir).
 pub fn default_journal_path() -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));

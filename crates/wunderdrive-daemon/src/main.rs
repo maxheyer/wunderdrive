@@ -17,8 +17,9 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 use wunderdrive_engine::protocol::{
     read_msg, write_msg, Request, Resolution, Response, METHOD_ACTIVITY, METHOD_INDEX_NOW,
-    METHOD_MATERIALIZE, METHOD_PAUSE, METHOD_RESOLVE_CONFLICT, METHOD_RESUME, METHOD_SEARCH,
-    METHOD_SNAPSHOT, METHOD_STATUS, METHOD_SYNC_NOW,
+    METHOD_MATERIALIZE, METHOD_PAUSE, METHOD_PIN_VERSION, METHOD_RESOLVE_CONFLICT,
+    METHOD_RESTORE_VERSION, METHOD_RESUME, METHOD_SEARCH, METHOD_SNAPSHOT, METHOD_STATUS,
+    METHOD_SYNC_NOW, METHOD_UNLOCK_KEY, METHOD_UNPIN_VERSION, METHOD_VERSION_HISTORY,
 };
 use wunderdrive_engine::Engine;
 
@@ -202,6 +203,65 @@ async fn dispatch(
             let _g = cmd_lock.lock().await;
             match engine.materialize(&key).await {
                 Ok(_) => Response::ok(id, serde_json::Value::Null),
+                Err(e) => err(e.to_string()),
+            }
+        }
+        METHOD_UNLOCK_KEY => {
+            let key = match req.params.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k.to_string(),
+                None => return err("missing 'key'".into()),
+            };
+            match engine.unlock_key(&key) {
+                Ok(was_locked) => Response::ok(id, serde_json::json!({ "was_locked": was_locked })),
+                Err(e) => err(e.to_string()),
+            }
+        }
+        METHOD_RESTORE_VERSION => {
+            let key = match req.params.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k.to_string(),
+                None => return err("missing 'key'".into()),
+            };
+            let version_id = match req.params.get("version_id").and_then(|v| v.as_str()) {
+                Some(v) => v.to_string(),
+                None => return err("missing 'version_id'".into()),
+            };
+            let _g = cmd_lock.lock().await;
+            match engine.restore_version(&key, &version_id).await {
+                Ok(_) => Response::ok(id, serde_json::Value::Null),
+                Err(e) => err(e.to_string()),
+            }
+        }
+        METHOD_PIN_VERSION => {
+            let key = match req.params.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k.to_string(),
+                None => return err("missing 'key'".into()),
+            };
+            let version_id = match req.params.get("version_id").and_then(|v| v.as_str()) {
+                Some(v) => v.to_string(),
+                None => return err("missing 'version_id'".into()),
+            };
+            match engine.pin_version(&key, &version_id) {
+                Ok(_) => Response::ok(id, serde_json::Value::Null),
+                Err(e) => err(e.to_string()),
+            }
+        }
+        METHOD_UNPIN_VERSION => {
+            let key = match req.params.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k.to_string(),
+                None => return err("missing 'key'".into()),
+            };
+            match engine.unpin_version(&key) {
+                Ok(_) => Response::ok(id, serde_json::Value::Null),
+                Err(e) => err(e.to_string()),
+            }
+        }
+        METHOD_VERSION_HISTORY => {
+            let key = match req.params.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k.to_string(),
+                None => return err("missing 'key'".into()),
+            };
+            match engine.version_history(&key) {
+                Ok(history) => Response::ok(id, serde_json::to_value(history).unwrap()),
                 Err(e) => err(e.to_string()),
             }
         }

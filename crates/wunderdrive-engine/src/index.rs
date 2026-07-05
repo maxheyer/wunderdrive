@@ -17,7 +17,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
-use crate::extract::extract_text;
+use crate::extract::{extract_text, OcrEngine};
 use crate::journal::{self, local_for_key};
 
 /// One search hit.
@@ -29,6 +29,10 @@ pub struct SearchHit {
     pub snippet: Option<String>,
 }
 
+/// Image file extensions that trigger OCR fallback when `extract_text`
+/// returns nothing (spec §6: text-layer first, OCR only as fallback).
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "tiff", "tif", "bmp", "gif"];
+
 pub struct Indexer {
     db: Arc<Database>,
     local_root: PathBuf,
@@ -37,12 +41,19 @@ pub struct Indexer {
     writer: Arc<TokioMutex<IndexWriter>>,
     key_field: Field,
     text_field: Field,
+    /// Optional OCR engine for image fallback (spec §6).
+    ocr: Option<Arc<dyn OcrEngine>>,
 }
 
 impl Indexer {
     /// Open or create the index at `dir`. Schema is fixed; mismatches return an
     /// error (caller wipes + recreates if the on-disk schema ever changes).
-    pub fn open(db: Arc<Database>, local_root: PathBuf, dir: &std::path::Path) -> Result<Self> {
+    pub fn open(
+        db: Arc<Database>,
+        local_root: PathBuf,
+        dir: &std::path::Path,
+        ocr: Option<Arc<dyn OcrEngine>>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let mut schema_builder = Schema::builder();
         // STRING (not TEXT) so deletes by exact key term match cleanly — TEXT
@@ -84,6 +95,7 @@ impl Indexer {
             writer: Arc::new(TokioMutex::new(writer)),
             key_field,
             text_field,
+            ocr,
         })
     }
 
@@ -126,9 +138,21 @@ impl Indexer {
                 t
             } else {
                 let path = local_for_key(&self.local_root, key);
-                let t = extract_text(&path)?.unwrap_or_default();
+                // Text-layer first (spec §6): try the normal extractor.
+                let mut t = extract_text(&path)?.unwrap_or_default();
+                // If no text was extracted and this is an image, try OCR
+                // as a fallback. Only images reach OCR — scanned PDFs
+                // without a text layer also produce empty here, but we
+                // don't render PDFs to images yet.
+                if t.is_empty() {
+                    if let Some(ocr_text) = self.try_ocr_fallback(key, &path) {
+                        t = ocr_text;
+                    }
+                }
                 // ponytail: empty string is the "no extractable text" sentinel
-                // so we don't re-parse binary files every sweep.
+                // so we don't re-parse binary files every sweep. If OCR
+                // also produced nothing, the empty string is cached, and
+                // we won't retry OCR next sweep either.
                 journal::extract_put(&self.db, &entry.blake3, &t)?;
                 t
             };
@@ -153,6 +177,35 @@ impl Indexer {
         self.reader.reload()?;
         debug!(net = count, "index sweep done");
         Ok(count.max(0) as usize)
+    }
+
+    /// Try OCR as a fallback for image files that yielded no text from
+    /// `extract_text`. Returns `None` if OCR is disabled, the file isn't an
+    /// image, or OCR produced nothing.
+    fn try_ocr_fallback(&self, key: &str, local_path: &std::path::Path) -> Option<String> {
+        // Guard 1: OCR engine must be available.
+        let ocr = self.ocr.as_ref()?;
+
+        // Guard 2: File must be an image extension.
+        let ext = local_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())?;
+        if !IMAGE_EXTS.contains(&ext.as_str()) {
+            return None;
+        }
+
+        // Read the image bytes and run OCR.
+        let bytes = match std::fs::read(local_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                debug!(key = key, error = %e, "failed to read image for OCR");
+                return None;
+            }
+        };
+
+        ocr.ocr(&bytes)
     }
 
     /// Drop a document by key. Called when a file leaves the journal.
@@ -272,7 +325,7 @@ mod tests {
         .unwrap();
 
         let idx_dir = db_dir.path().join("idx");
-        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir).unwrap();
+        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir, None).unwrap();
         let n = indexer.sweep().await.unwrap();
         assert_eq!(n, 2);
 
@@ -301,7 +354,7 @@ mod tests {
         )
         .unwrap();
         let idx_dir = db_dir.path().join("idx");
-        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir).unwrap();
+        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir, None).unwrap();
         assert_eq!(indexer.sweep().await.unwrap(), 1);
         // Second sweep: cache hit, no new docs.
         assert_eq!(indexer.sweep().await.unwrap(), 0);
@@ -326,7 +379,7 @@ mod tests {
         )
         .unwrap();
         let idx_dir = db_dir.path().join("idx");
-        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir).unwrap();
+        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir, None).unwrap();
         indexer.sweep().await.unwrap();
         // "documentatoin" is one transposition away from "documentation".
         let hits = indexer.search("documentatoin", 5).unwrap();
@@ -353,7 +406,7 @@ mod tests {
         )
         .unwrap();
         let idx_dir = db_dir.path().join("idx");
-        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir).unwrap();
+        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir, None).unwrap();
         indexer.sweep().await.unwrap();
         indexer.delete("gone.txt").await.unwrap();
         assert!(indexer.search("ephemeral", 5).unwrap().is_empty());
@@ -380,7 +433,7 @@ mod tests {
         )
         .unwrap();
         let idx_dir = db_dir.path().join("idx");
-        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir).unwrap();
+        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir, None).unwrap();
         indexer.sweep().await.unwrap();
         assert_eq!(indexer.search("lingers", 5).unwrap().len(), 1);
         // Sync deletes the file: journal loses the entry, INDEXED_TABLE keeps it.
@@ -411,7 +464,7 @@ mod tests {
         )
         .unwrap();
         let idx_dir = db_dir.path().join("idx");
-        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir).unwrap();
+        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir, None).unwrap();
         indexer.sweep().await.unwrap();
         assert_eq!(indexer.search("renamed", 5).unwrap()[0].key, "old.txt");
         // Rename in the journal: old key gone, new key added, same hash.
@@ -431,5 +484,92 @@ mod tests {
         let hits = indexer.search("renamed", 5).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].key, "new.txt");
+    }
+
+    #[tokio::test]
+    async fn sweep_uses_ocr_fallback_for_images() {
+        // A "fake image" (just bytes) with no extractable text — the mock
+        // OCR engine should provide the text.
+        struct MockOcr;
+        impl crate::extract::OcrEngine for MockOcr {
+            fn ocr(&self, _image_bytes: &[u8]) -> Option<String> {
+                Some("OCR extracted text".to_string())
+            }
+        }
+
+        let (db_dir, db) = tmp_db();
+        let root = tempfile::tempdir().unwrap();
+        let f = root.path().join("scan.png");
+        std::fs::write(&f, b"fake image bytes").unwrap();
+        let h = crate::hash::hash_file(&f).unwrap();
+        journal::upsert(
+            &db,
+            "scan.png",
+            &JournalEntry {
+                blake3: h,
+                size: 16,
+                mtime_millis: 1,
+                remote_version: None,
+            },
+        )
+        .unwrap();
+
+        let idx_dir = db_dir.path().join("idx");
+        let indexer = Indexer::open(
+            db.clone(),
+            root.path().to_path_buf(),
+            &idx_dir,
+            Some(Arc::new(MockOcr)),
+        )
+        .unwrap();
+        let n = indexer.sweep().await.unwrap();
+        assert_eq!(n, 1, "OCR text should have been indexed");
+
+        let hits = indexer.search("OCR", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "scan.png");
+    }
+
+    #[tokio::test]
+    async fn sweep_does_not_ocr_non_image_files() {
+        // A .txt file with no readable text-like content should NOT trigger
+        // OCR — even if the OCR engine would return text.
+        struct AlwaysOcr;
+        impl crate::extract::OcrEngine for AlwaysOcr {
+            fn ocr(&self, _image_bytes: &[u8]) -> Option<String> {
+                Some("should not appear".to_string())
+            }
+        }
+
+        let (db_dir, db) = tmp_db();
+        let root = tempfile::tempdir().unwrap();
+        let f = root.path().join("data.bin");
+        std::fs::write(&f, b"\0\0\0\0").unwrap();
+        let h = crate::hash::hash_file(&f).unwrap();
+        journal::upsert(
+            &db,
+            "data.bin",
+            &JournalEntry {
+                blake3: h,
+                size: 4,
+                mtime_millis: 1,
+                remote_version: None,
+            },
+        )
+        .unwrap();
+
+        let idx_dir = db_dir.path().join("idx");
+        let indexer = Indexer::open(
+            db.clone(),
+            root.path().to_path_buf(),
+            &idx_dir,
+            Some(Arc::new(AlwaysOcr)),
+        )
+        .unwrap();
+        indexer.sweep().await.unwrap();
+
+        // The OCR engine should not have been called for a .bin file.
+        let hits = indexer.search("should not appear", 5).unwrap();
+        assert!(hits.is_empty(), "OCR should not run on non-image files");
     }
 }

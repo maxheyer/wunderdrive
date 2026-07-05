@@ -82,6 +82,10 @@ pub struct Inputs<'a> {
     /// stubs instead of being downloaded; local deletes dematerialize instead
     /// of propagating to the remote.
     pub lazy: bool,
+    /// Whether the remote listing is incremental (offset-based, not full).
+    /// When true, a key absent from `remote` is not treated as deleted —
+    /// it simply wasn't listed. Only a full listing can detect remote deletes.
+    pub incremental: bool,
 }
 
 /// Decide the action list for every key in the union of the four inputs.
@@ -111,6 +115,7 @@ pub fn plan(inputs: Inputs<'_>) -> Vec<(String, Action)> {
             inputs.remote.get(&key),
             inputs.stub.get(&key),
             inputs.lazy,
+            inputs.incremental,
         );
         out.push((key, action));
     }
@@ -120,13 +125,15 @@ pub fn plan(inputs: Inputs<'_>) -> Vec<(String, Action)> {
 /// Decide the action for a single key. Exposed for unit testing.
 ///
 /// `stub` is the prior stub entry for this key (if any); `lazy` selects the
-/// lazy-download policy.
+/// lazy-download policy. `incremental` indicates the remote listing was
+/// offset-based (not full), so an absent remote entry does not imply deletion.
 pub fn decide(
     j: Option<&JournalEntry>,
     l: Option<&Local>,
     r: Option<&Remote>,
     stub: Option<&StubEntry>,
     lazy: bool,
+    incremental: bool,
 ) -> Action {
     match (j, l, r) {
         // Baseline exists (materialized file) — reconcile against it.
@@ -148,8 +155,16 @@ pub fn decide(
                 Action::DeleteRemote
             }
         }
-        // Materialized file deleted locally, remote also gone → full delete.
-        (Some(_), Some(_), None) => Action::DeleteLocal,
+        // Materialized file + local, remote gone. If incremental listing, we
+        // don't know the remote is truly gone — skip and wait for a full list.
+        // If full listing, delete local.
+        (Some(_), Some(_), None) => {
+            if incremental {
+                Action::Skip
+            } else {
+                Action::DeleteLocal
+            }
+        }
         // Baseline only, both gone → clean up the journal.
         (Some(_), None, None) => Action::DropJournal,
 
@@ -218,11 +233,15 @@ mod tests {
     }
 
     fn act(j: Option<JournalEntry>, l: Option<Local>, r: Option<Remote>) -> Action {
-        decide(j.as_ref(), l.as_ref(), r.as_ref(), None, false)
+        decide(j.as_ref(), l.as_ref(), r.as_ref(), None, false, false)
     }
 
     fn act_lazy(j: Option<JournalEntry>, l: Option<Local>, r: Option<Remote>) -> Action {
-        decide(j.as_ref(), l.as_ref(), r.as_ref(), None, true)
+        decide(j.as_ref(), l.as_ref(), r.as_ref(), None, true, false)
+    }
+
+    fn act_incremental(j: Option<JournalEntry>, l: Option<Local>, r: Option<Remote>) -> Action {
+        decide(j.as_ref(), l.as_ref(), r.as_ref(), None, false, true)
     }
 
     fn stub(size: u64, ver: Option<&str>) -> StubEntry {
@@ -354,6 +373,7 @@ mod tests {
             remote: &remote,
             stub: &stubs,
             lazy: false,
+            incremental: false,
         });
         let keys: Vec<_> = actions.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["a", "b", "c"]);
@@ -400,7 +420,7 @@ mod tests {
         // Already stubbed → Skip (don't re-record).
         let s = stub(10, Some("v"));
         assert_eq!(
-            decide(None, None, Some(&r(10, Some("v"))), Some(&s), true),
+            decide(None, None, Some(&r(10, Some("v"))), Some(&s), true, false),
             Action::Skip
         );
     }
@@ -420,6 +440,35 @@ mod tests {
         assert_eq!(
             act(Some(j(1, 10, 100, Some("v"))), None, Some(r(10, Some("v")))),
             Action::DeleteRemote
+        );
+    }
+
+    // --- incremental listing mode ---
+
+    #[test]
+    fn incremental_listing_skips_missing_remote() {
+        // Full listing: remote gone → DeleteLocal.
+        assert_eq!(
+            act(Some(j(1, 10, 100, Some("v"))), Some(l(10, 100)), None),
+            Action::DeleteLocal
+        );
+        // Incremental listing: remote absent ≠ deleted → Skip.
+        assert_eq!(
+            act_incremental(Some(j(1, 10, 100, Some("v"))), Some(l(10, 100)), None),
+            Action::Skip
+        );
+    }
+
+    #[test]
+    fn incremental_listing_still_detects_remote_changes() {
+        // When the key IS in the incremental listing, reconcile normally.
+        assert_eq!(
+            act_incremental(
+                Some(j(1, 10, 100, Some("v"))),
+                Some(l(10, 100)),
+                Some(r(10, Some("v2")))
+            ),
+            Action::Download
         );
     }
 }

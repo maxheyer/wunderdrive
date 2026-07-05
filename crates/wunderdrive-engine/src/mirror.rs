@@ -5,7 +5,7 @@
 //! mirror is a real folder on disk, so browsing/opening never touches S3
 //! (spec §2 invariant: "Fast = never touch S3 on the interactive path").
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -81,9 +81,16 @@ impl Mirror {
         let _ = tx.try_send(SyncEvent::Started);
         let journal_map = journal::snapshot(&self.db)?;
         let stub_map = journal::stub_list(&self.db)?;
+        let locked = journal::lock_list(&self.db)?;
 
         let local = self.gather_local()?;
-        let remote = self.gather_remote().await?;
+
+        // Incremental listing: every Nth sync, do a full listing to catch
+        // deletes. Otherwise use offset-based listing to skip already-seen keys.
+        const FULL_LIST_INTERVAL: u64 = 10;
+        let meta = journal::meta_get(&self.db)?;
+        let do_full = meta.sync_count % FULL_LIST_INTERVAL == 0;
+        let (remote, incremental, last_key) = self.gather_remote(do_full, &meta).await?;
 
         let actions = plan(Inputs {
             journal: &journal_map,
@@ -91,20 +98,48 @@ impl Mirror {
             remote: &remote,
             stub: &stub_map,
             lazy: self.cfg.lazy,
+            incremental,
         });
 
         let mut out = SyncOutcome::default();
         for (key, action) in actions {
+            // Skip keys under Object Lock retention — retrying is futile.
+            if locked.contains(&key) && action != Action::Skip {
+                debug!(key = %key, "skipping locked key");
+                out.skipped += 1;
+                continue;
+            }
             if let Err(e) = self
                 .apply(&key, &action, &journal_map, &local, &remote, tx)
                 .await
             {
-                warn!(key = %key, error = %e, "sync action failed");
-                out.errors += 1;
-                let _ = tx.try_send(SyncEvent::Error(key.clone(), e.to_string()));
+                if is_permission_denied(&e) {
+                    // S3 Object Lock (or IAM policy) blocks this operation.
+                    // Mark the key so we stop retrying every sync cycle.
+                    warn!(key = %key, "permission denied — marking as locked");
+                    let _ = journal::lock_add(&self.db, &key);
+                    out.errors += 1;
+                    let _ = tx.try_send(SyncEvent::Error(
+                        key.clone(),
+                        "object locked (retention/legal hold)".into(),
+                    ));
+                } else {
+                    warn!(key = %key, error = %e, "sync action failed");
+                    out.errors += 1;
+                    let _ = tx.try_send(SyncEvent::Error(key.clone(), e.to_string()));
+                }
             } else {
                 self.tally(&action, &mut out);
             }
+        }
+
+        // Update sync metadata for the next incremental pass.
+        let new_meta = journal::SyncMeta {
+            last_remote_key: last_key.or(meta.last_remote_key),
+            sync_count: meta.sync_count + 1,
+        };
+        if let Err(e) = journal::meta_put(&self.db, &new_meta) {
+            debug!(error = %e, "failed to update sync metadata");
         }
 
         info!(?out, "sync finished");
@@ -153,23 +188,63 @@ impl Mirror {
 
     /// List the (prefixed) bucket and build the `key → Remote` map.
     ///
+    /// When `full` is false and a `last_remote_key` offset exists in `meta`,
+    /// uses offset-based listing (S3 `start-after`) to skip already-seen keys.
+    /// Returns `(map, is_incremental, last_key_seen)`.
+    ///
     /// Uses only the cheap listing signal — no `get`. Content hashes are read
     /// lazily later, only for keys that actually changed (spec §5).
-    async fn gather_remote(&self) -> Result<HashMap<String, Remote>> {
+    async fn gather_remote(
+        &self,
+        full: bool,
+        meta: &journal::SyncMeta,
+    ) -> Result<(HashMap<String, Remote>, bool, Option<String>)> {
         let mut map = HashMap::new();
-        let mut stream = self.store.list(None);
-        while let Some(meta) = futures::StreamExt::next(&mut stream).await {
-            let meta = meta?;
-            let key = meta.location.to_string();
+        let mut last_key: Option<String> = None;
+
+        // Decide: incremental (offset-based) or full listing.
+        let incremental = !full && meta.last_remote_key.is_some();
+
+        let mut stream = if incremental {
+            let offset_str = meta.last_remote_key.as_deref().unwrap();
+            let offset = object_store::path::Path::parse(offset_str)?;
+            debug!(offset = %offset_str, "incremental remote listing");
+            self.store.list_with_offset(None, &offset)
+        } else {
+            debug!("full remote listing");
+            self.store.list(None)
+        };
+
+        while let Some(obj_meta) = futures::StreamExt::next(&mut stream).await {
+            let obj_meta = obj_meta?;
+            let key = obj_meta.location.to_string();
+            last_key = Some(key.clone());
+            let version = obj_meta.version.clone().or(obj_meta.e_tag.clone());
+            // Record the version in the history (for version restore).
+            if let Some(ref vid) = version {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let entry = journal::VersionEntry {
+                    version_id: vid.clone(),
+                    seen_millis: now,
+                    size: obj_meta.size,
+                };
+                if let Err(e) = journal::version_add(&self.db, &key, &entry) {
+                    debug!(key = %key, error = %e, "failed to record version history");
+                }
+            }
             map.insert(
                 key,
                 Remote {
-                    size: meta.size,
-                    version: meta.version.clone().or(meta.e_tag.clone()),
+                    size: obj_meta.size,
+                    version,
                 },
             );
         }
-        Ok(map)
+
+        Ok((map, incremental, last_key))
     }
 
     /// Apply a single planned action.
@@ -392,15 +467,20 @@ impl Mirror {
     }
 
     /// Fetch `key` plus its content-hash attribute. Returns (bytes, attr_hash, version).
+    ///
+    /// If the key is pinned to a specific version (see [`journal::pin_get`]),
+    /// fetches that version instead of HEAD.
     async fn fetch_with_hash(
         &self,
         key: &str,
     ) -> Result<(bytes::Bytes, Option<[u8; 32]>, Option<String>)> {
         let path = self.parse_path(key);
-        let result = self
-            .store
-            .get_opts(&path, object_store::GetOptions::default())
-            .await?;
+        let mut opts = object_store::GetOptions::default();
+        // Pinned version: fetch the specific version instead of HEAD.
+        if let Ok(Some(pinned)) = journal::pin_get(&self.db, key) {
+            opts.version = Some(pinned);
+        }
+        let result = self.store.get_opts(&path, opts).await?;
         let version = result.meta.version.clone().or(result.meta.e_tag.clone());
         let attr_hash = result
             .attributes
@@ -541,6 +621,19 @@ impl Mirror {
         }
     }
 
+    /// Clear the Object-Lock marker on a key so the next sync retries it.
+    /// Returns `true` if the key was previously locked.
+    pub fn unlock_key(&self, key: &str) -> Result<bool> {
+        let was_locked = journal::lock_list(&self.db)?.contains(key);
+        journal::lock_clear(&self.db, key)?;
+        Ok(was_locked)
+    }
+
+    /// List keys currently marked as Object-Lock-locked.
+    pub fn locked_keys(&self) -> Result<HashSet<String>> {
+        journal::lock_list(&self.db)
+    }
+
     /// Materialize a lazy-download stub: fetch the bytes, write the local file,
     /// promote the stub to the main journal. The next index sweep will pick it
     /// up for search. No-op (returns Ok) if the key isn't a stub.
@@ -565,6 +658,57 @@ impl Mirror {
         journal::stub_remove(&self.db, key)?;
         info!(key = %key, "materialized stub");
         Ok(())
+    }
+
+    /// Restore a key to a specific version: fetch the old version's bytes,
+    /// write them locally, and re-upload as the new HEAD. Clears any pin.
+    ///
+    /// Requires S3 bucket versioning to be enabled. The old version remains
+    /// accessible in the bucket's version history.
+    pub async fn restore_version(&self, key: &str, version_id: &str) -> Result<()> {
+        let path = self.parse_path(key);
+        let opts = object_store::GetOptions {
+            version: Some(version_id.to_string()),
+            ..Default::default()
+        };
+        let result = self.store.get_opts(&path, opts).await?;
+        let bytes = result.bytes().await?;
+        let hash = crate::hash::hash_bytes(&bytes);
+
+        // Write the restored bytes locally.
+        let local_path = local_for_key(&self.cfg.local_root, key);
+        self.write_file(&local_path, &bytes).await?;
+
+        // Re-upload as the new HEAD so other devices pick it up.
+        let new_version = self.do_upload(key, &local_path, &hash).await?;
+
+        let entry = JournalEntry {
+            blake3: hash,
+            size: bytes.len() as u64,
+            mtime_millis: mtime_millis(&local_path)?,
+            remote_version: new_version,
+        };
+        journal::upsert(&self.db, key, &entry)?;
+        // Clear any pin — the restored version is now HEAD.
+        journal::pin_clear(&self.db, key)?;
+        info!(key = %key, version = %version_id, "restored version");
+        Ok(())
+    }
+
+    /// Pin a key to a specific version. Subsequent downloads/materialize
+    /// fetch this version instead of HEAD.
+    pub fn pin_version(&self, key: &str, version_id: &str) -> Result<()> {
+        journal::pin_set(&self.db, key, version_id)
+    }
+
+    /// Remove the version pin for a key.
+    pub fn unpin_version(&self, key: &str) -> Result<()> {
+        journal::pin_clear(&self.db, key)
+    }
+
+    /// List the recorded version history for a key.
+    pub fn version_history(&self, key: &str) -> Result<Vec<journal::VersionEntry>> {
+        Ok(journal::version_list(&self.db, key)?.unwrap_or_default())
     }
 }
 
@@ -670,5 +814,15 @@ fn tally_action(action: &Action, out: &mut SyncOutcome) {
         // Lazy-mode bookkeeping; not counted as sync transfer activity.
         Action::RecordStub | Action::Dematerialize => {}
         Action::DropJournal | Action::Compare => {}
+    }
+}
+
+/// Check whether an [`object_store::Error`] is a permission-denied (Object Lock)
+/// error. S3 returns 403 Forbidden when an operation violates Object Lock
+/// retention or legal hold.
+fn is_permission_denied(e: &crate::Error) -> bool {
+    match e {
+        crate::Error::ObjectStore(object_store::Error::PermissionDenied { .. }) => true,
+        _ => false,
     }
 }

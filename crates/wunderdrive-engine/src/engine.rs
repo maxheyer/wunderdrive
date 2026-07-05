@@ -65,6 +65,9 @@ pub struct Snapshot {
     pub paused: bool,
     pub last_sync_millis: Option<u64>,
     pub files: Vec<FileStat>,
+    /// Keys currently blocked by S3 Object Lock retention.
+    #[serde(default)]
+    pub locked_keys: Vec<String>,
 }
 
 /// Daemon status summary.
@@ -156,7 +159,8 @@ impl Engine {
                 "no S3 credentials found. Set one of: \
                  `wunderdrive-daemon --access-key-id ID --secret-access-key KEY`, \
                  the WUNDERDRIVE_ACCESS_KEY_ID/WUNDERDRIVE_SECRET_ACCESS_KEY env vars, \
-                 or store them in the OS keychain."
+                 the OS keychain, \
+                 or ~/.config/wunderdrive/credentials.toml (mode 0600, headless fallback)."
                     .into(),
             )
         })?;
@@ -172,8 +176,22 @@ impl Engine {
 
         // Indexer is optional: a failure to open the Tantivy dir must not stop
         // sync. The daemon still serves files; search just returns [].
-        let indexer = match Indexer::open(db.clone(), cfg.local_root.clone(), &default_index_path())
-        {
+        // Build the OCR engine from environment. If env vars aren't set or
+        // models can't load, this returns a disabled engine (wraps None).
+        let ocr_engine: Option<Arc<dyn crate::extract::OcrEngine>> = {
+            let e = crate::ocr::OcrsEngine::from_env();
+            if e.is_enabled() {
+                Some(Arc::new(e))
+            } else {
+                None
+            }
+        };
+        let indexer = match Indexer::open(
+            db.clone(),
+            cfg.local_root.clone(),
+            &default_index_path(),
+            ocr_engine,
+        ) {
             Ok(i) => Some(Arc::new(i)),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to open search index; search disabled");
@@ -284,10 +302,17 @@ impl Engine {
             });
         }
 
+        let locked_keys: Vec<String> = {
+            let mut v: Vec<String> = self.mirror.locked_keys()?.into_iter().collect();
+            v.sort();
+            v
+        };
+
         Ok(Snapshot {
             paused: self.state.paused.load(Ordering::Relaxed),
             last_sync_millis: *self.state.last_sync_millis.lock().unwrap(),
             files,
+            locked_keys,
         })
     }
 
@@ -346,6 +371,34 @@ impl Engine {
         self.state.conflicts.lock().unwrap().remove(key);
         self.sync_now().await?;
         Ok(())
+    }
+
+    /// Clear the Object-Lock marker on a key so the next sync retries it.
+    pub fn unlock_key(&self, key: &str) -> Result<bool> {
+        self.mirror.unlock_key(key)
+    }
+
+    /// Restore a key to a specific version. Fetches the old version and
+    /// re-uploads it as HEAD.
+    pub async fn restore_version(&self, key: &str, version_id: &str) -> Result<()> {
+        self.mirror.restore_version(key, version_id).await?;
+        let _ = self.sync_now().await;
+        Ok(())
+    }
+
+    /// Pin a key to a specific version.
+    pub fn pin_version(&self, key: &str, version_id: &str) -> Result<()> {
+        self.mirror.pin_version(key, version_id)
+    }
+
+    /// Remove the version pin for a key.
+    pub fn unpin_version(&self, key: &str) -> Result<()> {
+        self.mirror.unpin_version(key)
+    }
+
+    /// List the recorded version history for a key.
+    pub fn version_history(&self, key: &str) -> Result<Vec<crate::journal::VersionEntry>> {
+        self.mirror.version_history(key)
     }
 
     /// Stop the sync loop and wait for it.

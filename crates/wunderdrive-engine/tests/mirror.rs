@@ -10,6 +10,7 @@ use std::sync::Arc;
 use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::sync::mpsc;
 use wunderdrive_engine::config::Config;
+use wunderdrive_engine::index::Indexer;
 use wunderdrive_engine::journal;
 use wunderdrive_engine::mirror::{Mirror, SyncEvent};
 
@@ -172,4 +173,31 @@ async fn conflict_keeps_both() {
 
 fn mirror_store(mirror: &Mirror) -> Arc<dyn ObjectStore> {
     mirror.store_handle()
+}
+
+#[tokio::test]
+async fn search_works_after_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let mirror = make_mirror(dir.path());
+    let root = mirror.cfg().local_root.clone();
+    std::fs::create_dir_all(&root).unwrap();
+
+    // Write a file and sync to upload it.
+    std::fs::write(root.join("doc.txt"), b"hello world from test").unwrap();
+    run_sync(&mirror).await;
+
+    // Create an indexer, sweep, and search.
+    let indexer = Indexer::open(
+        mirror.db().clone(),
+        root.clone(),
+        &dir.path().join("idx"),
+        None,
+    )
+    .unwrap();
+    indexer.sweep().await.unwrap();
+
+    let hits = indexer.search("hello", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].key, "doc.txt");
+    assert!(hits[0].snippet.as_deref().unwrap().contains("hello"));
 }
