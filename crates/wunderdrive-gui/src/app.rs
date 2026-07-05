@@ -10,12 +10,14 @@ use iced::{Alignment, Element, Length, Subscription, Task};
 use wunderdrive_engine::protocol::Resolution;
 use wunderdrive_engine::{FileStat, FileStatus, SearchHit, Snapshot, Status};
 
-use crate::{ipc, theme};
+use crate::{icons, ipc, theme};
 
 const SOCKET: &str = "wunderdrive";
 const SEARCH_LIMIT: usize = 100;
 const SEARCH_DEBOUNCE_MS: u64 = 150;
 const SEARCH_ID: iced::widget::Id = iced::widget::Id::new("search");
+const SIDEBAR_WIDTH: f32 = 232.0;
+const TOOLBAR_HEIGHT: f32 = 48.0;
 
 pub struct App {
     state: AppState,
@@ -27,6 +29,16 @@ enum AppState {
     Error(String),
 }
 
+/// The five navigable screens in the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Overview,
+    Files,
+    Search,
+    Conflicts,
+    Activity,
+}
+
 struct Conn {
     status: Status,
     snapshot: Snapshot,
@@ -35,12 +47,12 @@ struct Conn {
     search_hits: Vec<SearchHit>,
     last_error: Option<String>,
     expanded_conflict: Option<String>,
-    show_preview: bool,
     selected: Option<String>,
     preview: Option<(String, PreviewContent)>,
     view_mode: ViewMode,
     cursor: Option<usize>,
     first_snapshot: bool,
+    screen: Screen,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +62,7 @@ enum ViewMode {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum PreviewContent {
     Text(String),
     Binary,
@@ -71,9 +84,9 @@ pub enum Message {
     ResolveConflict(String, Resolution),
     ToggleConflict(String),
     SelectFile(String),
-    TogglePreview,
     PreviewLoaded(String, PreviewContent),
     FocusSearch,
+    Navigate(Screen),
     Escape,
     Backspace,
     MoveCursor(i32),
@@ -111,12 +124,12 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 search_hits: Vec::new(),
                 last_error: None,
                 expanded_conflict: None,
-                show_preview: false,
                 selected: None,
                 preview: None,
                 view_mode: ViewMode::List,
                 cursor: None,
                 first_snapshot: true,
+                screen: Screen::Files,
             });
             poll_snapshot()
         }
@@ -158,6 +171,7 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                     c.path.push_str(&name);
                     c.cursor = None;
                     c.selected = None;
+                    c.screen = Screen::Files;
                 }
             }
             Task::none()
@@ -245,12 +259,6 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::TogglePreview => {
-            if let AppState::Connected(c) = &mut state.state {
-                c.show_preview = !c.show_preview;
-            }
-            Task::none()
-        }
         Message::PreviewLoaded(key, content) => {
             if let AppState::Connected(c) = &mut state.state {
                 if c.selected.as_deref() == Some(key.as_str()) {
@@ -259,14 +267,28 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::FocusSearch => iced::widget::operation::focus(SEARCH_ID),
+        Message::FocusSearch => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.screen = Screen::Search;
+            }
+            iced::widget::operation::focus(SEARCH_ID)
+        }
+        Message::Navigate(screen) => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.screen = screen;
+                if screen == Screen::Search {
+                    return iced::widget::operation::focus(SEARCH_ID);
+                }
+            }
+            Task::none()
+        }
         Message::Escape => {
             if let AppState::Connected(c) = &mut state.state {
                 if !c.search_query.is_empty() {
                     c.search_query.clear();
                     c.search_hits.clear();
-                } else if c.show_preview {
-                    c.show_preview = false;
+                } else if c.screen == Screen::Search {
+                    c.screen = Screen::Files;
                 } else {
                     c.cursor = None;
                     c.selected = None;
@@ -339,7 +361,7 @@ pub fn view(state: &App) -> Element<'_, Message> {
         AppState::Connected(c) => main_layout(c),
         AppState::Error(e) => container(
             column![
-                text(format!("{e}")).size(14).color(theme::ERROR),
+                text(format!("{e}")).size(14).color(theme::SYNC_ERROR),
                 button(text("Retry").size(13))
                     .on_press(Message::Retry)
                     .padding([6, 16])
@@ -355,154 +377,274 @@ pub fn view(state: &App) -> Element<'_, Message> {
 }
 
 fn main_layout(c: &Conn) -> Element<'_, Message> {
-    if c.show_preview {
-        row![sidebar(c), content(c), preview_pane(c)]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    } else {
-        row![sidebar(c), content(c)]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    }
+    row![sidebar(c), content(c)]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
+
+// ---- Sidebar (design §3.4) ----
 
 fn sidebar(c: &Conn) -> Element<'_, Message> {
     let conflicts = conflict_count(&c.snapshot);
 
-    let mut header = column![text("wunderdrive").size(15).font(iced::Font {
-        weight: iced::font::Weight::Semibold,
-        ..iced::Font::DEFAULT
-    })]
+    let header = row![
+        text(c.status.bucket.clone())
+            .size(14)
+            .font(iced::Font {
+                weight: iced::font::Weight::Semibold,
+                ..iced::Font::DEFAULT
+            })
+            .color(theme::TEXT_PRIMARY)
+            .width(Length::Fill),
+        icons::chevron_right(theme::TEXT_TERTIARY),
+    ]
+    .align_y(Alignment::Center)
+    .padding([0, 4]);
+
+    let nav = column![
+        nav_item("Overview", Screen::Overview, c.screen, false),
+        nav_item("Files", Screen::Files, c.screen, false),
+        nav_item("Search", Screen::Search, c.screen, false),
+        nav_item("Conflicts", Screen::Conflicts, c.screen, conflicts > 0),
+        nav_item("Activity", Screen::Activity, c.screen, false),
+    ]
     .spacing(2);
 
-    header = header.push(
-        text(c.status.bucket.clone())
-            .size(12)
-            .color(theme::INK_DULL),
-    );
-    header = header.push(
-        text(format!("{} files", c.snapshot.files.len()))
-            .size(11)
-            .color(theme::INK_FAINT),
-    );
-    if conflicts > 0 {
-        header = header.push(
-            container(
-                text(format!(
-                    "{} conflict{}",
-                    conflicts,
-                    if conflicts == 1 { "" } else { "s" }
-                ))
-                .size(11),
-            )
-            .style(theme::badge_container)
-            .padding([3, 10]),
-        );
-    }
+    let folders_label = text("FOLDERS")
+        .size(11)
+        .font(iced::Font {
+            weight: iced::font::Weight::Bold,
+            ..iced::Font::DEFAULT
+        })
+        .color(theme::TEXT_TERTIARY);
 
-    let sync_label = if c.status.paused { "Paused" } else { "Syncing" };
-    let toggle_label = if c.status.paused { "Resume" } else { "Pause" };
-    let sync_color = if c.status.paused {
-        theme::WARNING
-    } else {
-        theme::SUCCESS
-    };
+    let mirror_root = c
+        .status
+        .local_root
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Mirror")
+        .to_string();
 
-    let controls = column![
-        row![
-            status_dot(sync_color),
-            text(sync_label.to_string()).size(11).color(theme::INK_DULL),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center),
-        button(text("Sync now").size(12))
-            .on_press(Message::SyncNow)
-            .width(Length::Fill)
-            .padding([6, 12])
-            .style(theme::primary_button),
-        button(text(toggle_label.to_string()).size(12))
-            .on_press(Message::PauseResume)
-            .width(Length::Fill)
-            .padding([6, 12])
-            .style(theme::gray_button),
+    let folders_section = column![
+        folders_label,
+        sidebar_folder_row(&mirror_root),
+        add_folder_button(),
     ]
-    .spacing(6);
+    .spacing(2);
+
+    let settings_row = button(
+        row![
+            icons::settings(theme::TEXT_SECONDARY),
+            text("Settings").size(13).color(theme::TEXT_SECONDARY),
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .on_press(Message::Navigate(Screen::Overview))
+    .width(Length::Fill)
+    .padding([6, 8])
+    .style(theme::subtle_button);
+
+    let sync_pill = sync_pill(c);
 
     container(
         column![
             container(header).padding(
                 iced::Padding::new(0.0)
                     .top(20)
-                    .right(20)
-                    .bottom(12)
-                    .left(20)
+                    .right(16)
+                    .bottom(16)
+                    .left(16)
             ),
+            container(nav).padding(iced::Padding::new(0.0).right(8).left(8)),
+            Space::new().height(Length::Fixed(16.0)),
+            container(folders_section).padding(iced::Padding::new(0.0).right(8).left(8)),
             Space::new().height(Length::Fill),
             container(
                 column![
                     container(Space::new().height(1.0))
                         .width(Length::Fill)
                         .style(divider_style),
-                    controls,
+                    settings_row,
+                    sync_pill,
                 ]
-                .spacing(12)
+                .spacing(8)
             )
-            .padding(
-                iced::Padding::new(0.0)
-                    .top(0.0)
-                    .right(16)
-                    .bottom(20)
-                    .left(16)
-            ),
+            .padding(iced::Padding::new(0.0).top(8.0).right(8).bottom(16).left(8)),
         ]
         .height(Length::Fill),
     )
-    .width(Length::Fixed(240.0))
+    .width(Length::Fixed(SIDEBAR_WIDTH))
     .height(Length::Fill)
     .style(theme::sidebar_container)
     .into()
 }
 
-fn content(c: &Conn) -> Element<'_, Message> {
-    let searching = !c.search_query.trim().is_empty();
-    let (folders, files) = split_dirs(&c.snapshot, &c.path);
-    let total = folders.len() + files.len();
-
-    let body: Element<'_, Message> = if searching {
-        search_results_view(&c.search_hits)
-    } else if total == 0 {
-        if c.first_snapshot {
-            centered_text("Loading…", 14.0)
-        } else {
-            empty_state()
-        }
+fn nav_item(
+    label: &str,
+    screen: Screen,
+    current: Screen,
+    has_badge: bool,
+) -> Element<'static, Message> {
+    let is_active = screen == current;
+    let text_color = if is_active {
+        theme::ACCENT_TEXT
     } else {
-        file_list_view(
-            &c.path,
-            &folders,
-            &files,
-            c.expanded_conflict.as_deref(),
-            c.view_mode,
-            c.cursor,
+        theme::TEXT_PRIMARY
+    };
+    let icon_color = if is_active {
+        theme::ACCENT_TEXT
+    } else {
+        theme::TEXT_SECONDARY
+    };
+
+    let icon = match screen {
+        Screen::Overview => icons::layout_grid(icon_color),
+        Screen::Files => icons::folder(icon_color),
+        Screen::Search => icons::search(icon_color),
+        Screen::Conflicts => icons::alert_triangle(icon_color),
+        Screen::Activity => icons::refresh_cw(icon_color),
+    };
+
+    let badge: Option<Element<'static, Message>> = if has_badge {
+        Some(
+            container(text("!").size(11).color(theme::SYNC_CONFLICT))
+                .padding([2, 6])
+                .style(theme::badge_container)
+                .into(),
         )
+    } else {
+        None
+    };
+
+    let row_content: Element<'static, Message> = if let Some(b) = badge {
+        row![
+            icon,
+            text(label.to_string()).size(13).color(text_color),
+            Space::new().width(Length::Fill),
+            b,
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        row![
+            icon,
+            text(label.to_string()).size(13).color(text_color),
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .into()
+    };
+
+    let mut btn = button(row_content)
+        .on_press(Message::Navigate(screen))
+        .width(Length::Fill)
+        .padding([6, 8]);
+
+    if is_active {
+        btn = btn.style(theme::selected_row_button);
+    } else {
+        btn = btn.style(theme::row_button);
+    }
+
+    btn.into()
+}
+
+fn sidebar_folder_row(name: &str) -> Element<'static, Message> {
+    button(
+        row![
+            icons::folder(theme::ACCENT_TEXT),
+            text(name.to_string()).size(13).color(theme::TEXT_PRIMARY),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .on_press(Message::Navigate(Screen::Files))
+    .width(Length::Fill)
+    .padding([6, 8])
+    .style(theme::row_button)
+    .into()
+}
+
+fn add_folder_button() -> Element<'static, Message> {
+    // TODO(engine): wire to real "add pinned folder" action.
+    button(
+        row![
+            icons::plus(theme::TEXT_TERTIARY),
+            text("Add Folder").size(13).color(theme::TEXT_TERTIARY),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([6, 8])
+    .style(theme::subtle_button)
+    .into()
+}
+
+/// Sync pill: dot + label, plus Sync-now / Pause icon-buttons.
+fn sync_pill(c: &Conn) -> Element<'_, Message> {
+    let (dot_color, label) = if c.status.paused {
+        (theme::SYNC_QUEUED, "Paused".to_string())
+    } else if let Some(ms) = c.status.last_sync_millis {
+        (theme::SYNC_SYNCED, format!("Synced · {}", ms_ago(ms)))
+    } else {
+        (theme::SYNC_SYNCING, "Syncing".to_string())
+    };
+
+    let pill = row![
+        status_dot(dot_color),
+        text(label).size(12).color(theme::TEXT_SECONDARY),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    let pause_icon = if c.status.paused {
+        icons::play(theme::TEXT_SECONDARY)
+    } else {
+        icons::pause(theme::TEXT_SECONDARY)
+    };
+
+    let controls = row![
+        button(icons::refresh_cw(theme::TEXT_SECONDARY))
+            .on_press(Message::SyncNow)
+            .padding([4, 6])
+            .style(theme::icon_button),
+        button(pause_icon)
+            .on_press(Message::PauseResume)
+            .padding([4, 6])
+            .style(theme::icon_button),
+    ]
+    .spacing(2);
+
+    row![pill, Space::new().width(Length::Fill), controls]
+        .align_y(Alignment::Center)
+        .padding([4, 4])
+        .into()
+}
+
+// ---- Content area: toolbar + screen body ----
+
+fn content(c: &Conn) -> Element<'_, Message> {
+    let body: Element<'_, Message> = match c.screen {
+        Screen::Files | Screen::Search => files_body(c),
+        Screen::Overview => overview_screen(c),
+        Screen::Conflicts => conflicts_screen(c),
+        Screen::Activity => activity_screen(c),
     };
 
     container(
         column![
-            top_bar(
-                &c.status,
-                &c.path,
-                &c.search_query,
-                searching,
-                c.view_mode,
-                c.show_preview
-            ),
+            toolbar(c),
             scrollable(body)
                 .height(Length::Fill)
                 .style(theme::thin_scrollable),
-            status_bar(total, &c.status, c.last_error.as_deref()),
         ]
         .height(Length::Fill),
     )
@@ -511,55 +653,53 @@ fn content(c: &Conn) -> Element<'_, Message> {
     .into()
 }
 
-fn top_bar<'a>(
-    status: &'a Status,
-    path: &'a str,
-    query: &'a str,
-    searching: bool,
-    view_mode: ViewMode,
-    preview_on: bool,
-) -> Element<'a, Message> {
-    let can_go_back = !path.is_empty();
-    let view_label = match view_mode {
-        ViewMode::List => "Grid",
-        ViewMode::Grid => "List",
-    };
-    let preview_label = if preview_on { "Hide" } else { "Preview" };
+/// Toolbar (48px): back · breadcrumb + count · centered search · grid/list toggle.
+fn toolbar(c: &Conn) -> Element<'_, Message> {
+    let can_go_back = !c.path.is_empty();
+    let (folders, files) = split_dirs(&c.snapshot, &c.path);
+    let total = folders.len() + files.len();
 
-    let breadcrumb_text = if searching {
-        format!("Search: {}", status.bucket)
-    } else if path.is_empty() {
-        status.bucket.clone()
+    let breadcrumb = if c.path.is_empty() {
+        c.status.bucket.clone()
     } else {
-        format!("{} / {}", status.bucket, path.trim_end_matches('/'))
+        format!("{} / {}", c.status.bucket, c.path.trim_end_matches('/'))
+    };
+
+    let count_caption = format!("{total} items");
+
+    let view_icon = match c.view_mode {
+        ViewMode::List => icons::layout_grid(theme::TEXT_SECONDARY),
+        ViewMode::Grid => icons::list_icon(theme::TEXT_SECONDARY),
     };
 
     container(
         row![
-            button(text("\u{2190}").size(16))
+            button(icons::arrow_left(theme::TEXT_SECONDARY))
                 .on_press_maybe(if can_go_back {
                     Some(Message::NavigateUp)
                 } else {
                     None
                 })
-                .padding([6, 10])
+                .padding([6, 8])
                 .style(theme::icon_button),
-            text(breadcrumb_text).size(13).color(theme::INK_DULL),
+            column![
+                text(breadcrumb).size(16).color(theme::TEXT_PRIMARY),
+                text(count_caption).size(12).color(theme::TEXT_TERTIARY),
+            ]
+            .spacing(0),
             Space::new().width(Length::Fill),
-            search_pill(query),
-            button(text(view_label.to_string()).size(11))
+            search_pill(&c.search_query),
+            Space::new().width(Length::Fixed(8.0)),
+            button(view_icon)
                 .on_press(Message::ToggleViewMode)
-                .padding([5, 10])
-                .style(theme::subtle_button),
-            button(text(preview_label.to_string()).size(11))
-                .on_press(Message::TogglePreview)
-                .padding([5, 10])
-                .style(theme::subtle_button),
+                .padding([6, 8])
+                .style(theme::icon_button),
         ]
         .spacing(8)
         .align_y(Alignment::Center),
     )
     .padding([10, 16])
+    .height(Length::Fixed(TOOLBAR_HEIGHT + 20.0))
     .style(theme::top_bar_container)
     .into()
 }
@@ -567,43 +707,279 @@ fn top_bar<'a>(
 fn search_pill(query: &str) -> Element<'_, Message> {
     container(
         row![
-            text("\u{1F50D}").size(13).color(theme::INK_FAINT),
-            text_input("Search…", query)
+            icons::search(theme::TEXT_TERTIARY),
+            text_input("Search documents…", query)
                 .id(SEARCH_ID)
                 .on_input(Message::SearchQuery)
-                .size(12)
+                .size(13)
                 .style(theme::borderless_input)
-                .width(Length::Fixed(180.0)),
+                .width(Length::Fixed(280.0)),
+            kbd_chip(if cfg!(target_os = "macos") {
+                "⌘K"
+            } else {
+                "Ctrl+K"
+            }),
         ]
-        .spacing(6)
+        .spacing(8)
         .align_y(Alignment::Center),
     )
-    .padding([5, 14])
+    .padding([6, 14])
     .style(theme::search_pill_container)
     .into()
 }
 
-fn status_bar<'a>(
-    count: usize,
-    status: &'a Status,
-    error: Option<&'a str>,
-) -> Element<'a, Message> {
-    let sync = status
-        .last_sync_millis
-        .map(ms_ago)
-        .unwrap_or_else(|| "never".into());
-    let msg = match error {
-        Some(e) => format!("{e}"),
-        None => format!("{count} items  \u{00B7}  last sync: {sync}"),
-    };
-    let color = if error.is_some() {
-        theme::ERROR
+fn kbd_chip(label: &str) -> Element<'_, Message> {
+    container(
+        text(label.to_string())
+            .size(11)
+            .font(theme::mono_font())
+            .color(theme::TEXT_TERTIARY),
+    )
+    .padding([2, 6])
+    .style(kbd_container)
+    .into()
+}
+
+fn kbd_container(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(theme::BG_KBD)),
+        text_color: Some(theme::TEXT_TERTIARY),
+        border: iced::Border {
+            color: theme::STROKE_SUBTLE,
+            width: 1.0,
+            radius: iced::border::radius(4.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
+// ---- Screen bodies ----
+
+fn files_body(c: &Conn) -> Element<'_, Message> {
+    let searching = !c.search_query.trim().is_empty();
+    if searching {
+        return search_results_view(&c.search_hits);
+    }
+
+    let (folders, files) = split_dirs(&c.snapshot, &c.path);
+    let total = folders.len() + files.len();
+
+    if total == 0 {
+        if c.first_snapshot {
+            return centered_text("Loading…", 14.0);
+        }
+        return empty_state();
+    }
+
+    file_list_view(
+        &c.path,
+        &folders,
+        &files,
+        c.expanded_conflict.as_deref(),
+        c.view_mode,
+        c.cursor,
+    )
+}
+
+fn overview_screen(c: &Conn) -> Element<'_, Message> {
+    // TODO(engine): expose per-state counts for a richer stat strip.
+    let total = c.snapshot.files.len();
+    let conflicts = conflict_count(&c.snapshot);
+    let synced = c
+        .snapshot
+        .files
+        .iter()
+        .filter(|f| f.status == FileStatus::Synced)
+        .count();
+
+    let last_error = c
+        .last_error
+        .as_ref()
+        .map(|e| {
+            text(format!("Last error: {e}"))
+                .size(12)
+                .color(theme::SYNC_ERROR)
+        })
+        .unwrap_or_else(|| text("").size(12));
+
+    column![
+        text("Overview").size(20).color(theme::TEXT_PRIMARY),
+        Space::new().height(Length::Fixed(16.0)),
+        row![
+            stat_card("Total files", &total.to_string()),
+            stat_card("Synced", &synced.to_string()),
+            stat_card("Conflicts", &conflicts.to_string()),
+        ]
+        .spacing(12),
+        Space::new().height(Length::Fixed(16.0)),
+        sync_card(c),
+        last_error,
+    ]
+    .spacing(4)
+    .padding(32)
+    .into()
+}
+
+fn stat_card(label: &str, value: &str) -> Element<'static, Message> {
+    container(
+        column![
+            text(value.to_string())
+                .size(24)
+                .font(iced::Font {
+                    weight: iced::font::Weight::Bold,
+                    ..iced::Font::DEFAULT
+                })
+                .color(theme::TEXT_PRIMARY),
+            text(label.to_string()).size(12).color(theme::TEXT_TERTIARY),
+        ]
+        .spacing(4),
+    )
+    .padding(16)
+    .width(Length::Fixed(120.0))
+    .style(theme::card_container)
+    .into()
+}
+
+fn sync_card(c: &Conn) -> Element<'static, Message> {
+    let state = if c.status.paused {
+        "Paused".to_string()
+    } else if let Some(ms) = c.status.last_sync_millis {
+        format!("Synced · {}", ms_ago(ms))
     } else {
-        theme::INK_FAINT
+        "Syncing".to_string()
     };
-    container(text(msg).size(11).color(color))
-        .padding([6, 16])
-        .style(theme::status_bar_container)
+    let dot_color = if c.status.paused {
+        theme::SYNC_QUEUED
+    } else if c.status.last_sync_millis.is_some() {
+        theme::SYNC_SYNCED
+    } else {
+        theme::SYNC_SYNCING
+    };
+
+    let pause_label = if c.status.paused { "Resume" } else { "Pause" };
+    let pause_icon = if c.status.paused {
+        icons::play(theme::TEXT_ON_ACCENT)
+    } else {
+        icons::pause(theme::TEXT_ON_ACCENT)
+    };
+
+    container(column![
+        row![
+            status_dot(dot_color),
+            text(state.to_string()).size(14).color(theme::TEXT_PRIMARY),
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+        Space::new().height(Length::Fixed(12.0)),
+        row![
+            button(
+                row![
+                    icons::refresh_cw(theme::TEXT_ON_ACCENT),
+                    text("Sync now").size(13).color(theme::TEXT_ON_ACCENT),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::SyncNow)
+            .padding([8, 16])
+            .style(theme::primary_button),
+            button(
+                row![
+                    pause_icon,
+                    text(pause_label.to_string())
+                        .size(13)
+                        .color(theme::TEXT_PRIMARY)
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::PauseResume)
+            .padding([8, 16])
+            .style(theme::gray_button),
+        ]
+        .spacing(8),
+    ])
+    .padding(20)
+    .style(theme::card_container)
+    .into()
+}
+
+fn conflicts_screen(c: &Conn) -> Element<'_, Message> {
+    let conflicts: Vec<&FileStat> = c
+        .snapshot
+        .files
+        .iter()
+        .filter(|f| f.status == FileStatus::Conflict)
+        .collect();
+
+    if conflicts.is_empty() {
+        return empty_state_for("No conflicts", "All files are in sync.");
+    }
+
+    let mut list = column![].spacing(1).padding([4, 8]);
+    for f in &conflicts {
+        let is_expanded = c.expanded_conflict.as_deref() == Some(f.key.as_str());
+        list = list.push(file_row(
+            f.key.clone(),
+            f.key.clone(),
+            f.size,
+            f.status,
+            is_expanded,
+            false,
+        ));
+    }
+    list.into()
+}
+
+fn activity_screen(_c: &Conn) -> Element<'static, Message> {
+    // TODO(engine): expose activity log via METHOD_ACTIVITY.
+    empty_state_for("Activity", "Recent sync activity will appear here.")
+}
+
+fn empty_state_for(title: &str, subtitle: &str) -> Element<'static, Message> {
+    column![
+        text(title.to_string()).size(16).color(theme::TEXT_PRIMARY),
+        text(subtitle.to_string())
+            .size(12)
+            .color(theme::TEXT_SECONDARY),
+    ]
+    .spacing(8)
+    .align_x(Alignment::Center)
+    .padding(60)
+    .into()
+}
+
+fn search_results_view(hits: &[SearchHit]) -> Element<'static, Message> {
+    if hits.is_empty() {
+        return centered_text("No matches", 13.0);
+    }
+    let mut list = column![].spacing(1).padding([4, 8]);
+    for h in hits {
+        let parent = parent_folder(&h.key);
+        list = list.push(search_row(&h.key, h.snippet.as_deref(), parent));
+    }
+    list.into()
+}
+
+fn search_row(key: &str, snippet: Option<&str>, parent: String) -> Element<'static, Message> {
+    let mut col = column![row![
+        icons::file_text(theme::TEXT_SECONDARY),
+        text(key.to_string()).size(13).color(theme::TEXT_PRIMARY),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)]
+    .spacing(2);
+    if let Some(s) = snippet {
+        let clean = strip_marks(s);
+        col = col.push(text(clean).size(11).color(theme::TEXT_TERTIARY));
+    }
+    button(col)
+        .on_press(Message::Open(parent))
+        .width(Length::Fill)
+        .padding([6, 12])
+        .style(theme::row_button)
         .into()
 }
 
@@ -623,8 +999,8 @@ fn file_list_view(
         list = list.push(
             button(
                 row![
-                    text("\u{2190}").size(13).color(theme::ACCENT),
-                    text("Back").size(12).color(theme::ACCENT),
+                    icons::arrow_left(theme::ACCENT_TEXT),
+                    text("Back").size(12).color(theme::ACCENT_TEXT),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
@@ -668,48 +1044,23 @@ fn file_list_view(
     list.into()
 }
 
-fn search_results_view(hits: &[SearchHit]) -> Element<'static, Message> {
-    if hits.is_empty() {
-        return centered_text("No matches", 13.0);
-    }
-    let mut list = column![].spacing(1).padding([4, 8]);
-    for h in hits {
-        let parent = parent_folder(&h.key);
-        list = list.push(search_row(&h.key, h.snippet.as_deref(), parent));
-    }
-    list.into()
-}
-
-fn search_row(key: &str, snippet: Option<&str>, parent: String) -> Element<'static, Message> {
-    let mut col = column![text(key.to_string()).size(13)].spacing(2);
-    if let Some(s) = snippet {
-        let clean = strip_marks(s);
-        col = col.push(text(clean).size(11).color(theme::INK_FAINT));
-    }
-    button(col)
-        .on_press(Message::Open(parent))
-        .width(Length::Fill)
-        .padding([6, 12])
-        .style(theme::row_button)
-        .into()
-}
-
 fn folder_row(name: &str, selected: bool) -> Element<'static, Message> {
     let display = name.trim_end_matches('/');
     button(
         row![
-            text("\u{25B8}")
-                .size(14)
-                .color(theme::ACCENT)
-                .width(Length::Fixed(20.0)),
-            text(display.to_string()).size(13),
+            icons::folder(theme::ACCENT_TEXT),
+            text(display.to_string())
+                .size(13)
+                .color(theme::TEXT_PRIMARY)
+                .width(Length::Fill),
+            icons::chevron_right(theme::TEXT_TERTIARY),
         ]
-        .spacing(6)
+        .spacing(8)
         .align_y(Alignment::Center),
     )
     .on_press(Message::Open(name.to_string()))
     .width(Length::Fill)
-    .padding([4, 12])
+    .padding([6, 12])
     .style(if selected {
         theme::selected_row_button
     } else {
@@ -722,8 +1073,10 @@ fn grid_cell(name: &str, selected: bool) -> Element<'static, Message> {
     let display = name.trim_end_matches('/');
     button(
         column![
-            text("\u{25B8}").size(24.0).color(theme::ACCENT),
-            text(display.to_string()).size(11),
+            icons::folder(theme::ACCENT_TEXT),
+            text(display.to_string())
+                .size(11)
+                .color(theme::TEXT_PRIMARY),
         ]
         .spacing(6)
         .align_x(Alignment::Center),
@@ -745,11 +1098,12 @@ fn file_grid_cell(
     status: FileStatus,
     selected: bool,
 ) -> Element<'static, Message> {
-    let (glyph, color) = status_glyph_colored(status);
+    let (glyph, color) = status_glyph_icon(status);
     let mut btn = button(
         column![
-            text(glyph.to_string()).size(24.0).color(color),
-            text(name).size(11),
+            icons::type_icon(&key, theme::TEXT_SECONDARY, 32.0),
+            text(name).size(11).color(theme::TEXT_PRIMARY),
+            glyph(color),
         ]
         .spacing(6)
         .align_x(Alignment::Center),
@@ -777,7 +1131,7 @@ fn file_row(
     conflict_expanded: bool,
     selected: bool,
 ) -> Element<'static, Message> {
-    let (glyph, glyph_color) = status_glyph_colored(status);
+    let (glyph_fn, glyph_color) = status_glyph_icon(status);
     let size_text = if status == FileStatus::RemoteOnly {
         "remote".to_string()
     } else {
@@ -786,18 +1140,22 @@ fn file_row(
 
     let mut row_btn = button(
         row![
-            text(glyph.to_string())
-                .size(10)
-                .color(glyph_color)
-                .width(Length::Fixed(20.0)),
-            text(name).size(13).width(Length::Fill),
-            text(size_text).size(11).color(theme::INK_FAINT),
+            glyph_fn(glyph_color),
+            icons::type_icon(&key, theme::TEXT_SECONDARY, 16.0),
+            text(name)
+                .size(13)
+                .color(theme::TEXT_PRIMARY)
+                .width(Length::Fill),
+            text(size_text)
+                .size(11)
+                .font(theme::mono_font())
+                .color(theme::TEXT_TERTIARY),
         ]
-        .spacing(6)
+        .spacing(8)
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .padding([4, 12])
+    .padding([6, 12])
     .style(if selected {
         theme::selected_row_button
     } else {
@@ -838,137 +1196,23 @@ fn res_button(label: &str, key: String, resolution: Resolution) -> Element<'stat
         .into()
 }
 
-fn preview_pane(c: &Conn) -> Element<'_, Message> {
-    let body: Element<'_, Message> = match &c.selected {
-        None => centered_text("No file selected", 13.0),
-        Some(key) => match c.snapshot.files.iter().find(|f| f.key == *key) {
-            None => centered_text("File not found", 13.0),
-            Some(f) => {
-                if f.status == FileStatus::RemoteOnly {
-                    preview_remote_only(f)
-                } else if is_text_ext(key) {
-                    preview_text(key, c.preview.as_ref())
-                } else {
-                    preview_metadata(f)
-                }
-            }
-        },
-    };
-
-    container(
-        column![
-            preview_header(c.selected.as_deref()),
-            scrollable(body)
-                .height(Length::Fill)
-                .style(theme::thin_scrollable),
-        ]
-        .height(Length::Fill),
-    )
-    .width(Length::FillPortion(2))
-    .height(Length::Fill)
-    .style(theme::preview_container)
-    .into()
-}
-
-fn preview_header(selected: Option<&str>) -> Element<'static, Message> {
-    let title = selected
-        .and_then(|k| k.rsplit('/').next())
-        .unwrap_or("Preview")
-        .to_string();
-    container(
-        row![
-            text(title).size(13).width(Length::Fill),
-            button(text("\u{00D7}").size(16))
-                .on_press(Message::TogglePreview)
-                .padding([2, 8])
-                .style(theme::icon_button),
-        ]
-        .align_y(Alignment::Center),
-    )
-    .padding([10, 16])
-    .into()
-}
-
-fn preview_remote_only(f: &FileStat) -> Element<'static, Message> {
-    column![
-        text("Not downloaded").size(14).color(theme::INK_DULL),
-        text("This file exists only in the remote bucket.")
-            .size(12)
-            .color(theme::INK_FAINT),
-        button(text("Download now").size(12))
-            .on_press(Message::Materialize(f.key.clone()))
-            .padding([6, 14])
-            .style(theme::primary_button),
-    ]
-    .spacing(10)
-    .padding(20)
-    .into()
-}
-
-fn preview_text<'a>(
-    key: &'a str,
-    preview: Option<&'a (String, PreviewContent)>,
-) -> Element<'a, Message> {
-    match preview {
-        Some((k, PreviewContent::Text(s))) if k == key => text(s.clone()).size(12).into(),
-        Some((k, PreviewContent::Error(e))) if k == key => {
-            text(format!("Could not read file: {e}"))
-                .size(12)
-                .color(theme::ERROR)
-                .into()
-        }
-        _ => centered_text("Loading…", 13.0),
-    }
-}
-
-fn preview_metadata(f: &FileStat) -> Element<'static, Message> {
-    let mtime = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(f.mtime_millis as i64)
-        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| "?".into());
-    let status_name = match f.status {
-        FileStatus::Synced => "Synced",
-        FileStatus::PendingUpload => "Pending upload",
-        FileStatus::NewLocal => "New local",
-        FileStatus::DeletedPending => "Deleted (pending)",
-        FileStatus::Conflict => "Conflict",
-        FileStatus::RemoteOnly => "Remote only",
-    };
-    column![
-        meta_row("Key", f.key.clone()),
-        meta_row("Size", human_size(f.size)),
-        meta_row("Status", status_name.to_string()),
-        meta_row("Modified", mtime),
-    ]
-    .spacing(6)
-    .padding(20)
-    .into()
-}
-
-fn meta_row(label: &str, value: String) -> Element<'static, Message> {
-    row![
-        text(label.to_string())
-            .size(11)
-            .color(theme::INK_FAINT)
-            .width(Length::Fixed(72.0)),
-        text(value).size(11),
-    ]
-    .spacing(8)
-    .into()
-}
-
 fn centered_text(msg: &str, size: f32) -> Element<'_, Message> {
-    container(text(msg).size(size).color(theme::INK_DULL))
+    container(text(msg).size(size).color(theme::TEXT_SECONDARY))
         .center(Length::Fill)
         .into()
 }
 
 fn empty_state() -> Element<'static, Message> {
     column![
-        text("No files synced yet").size(16),
+        text("No files synced yet")
+            .size(16)
+            .color(theme::TEXT_PRIMARY),
         text("Drop files into your local mirror folder, or sync the remote bucket.")
             .size(12)
-            .color(theme::INK_DULL),
-        text("Press / to search").size(11).color(theme::INK_FAINT),
+            .color(theme::TEXT_SECONDARY),
+        text("Press / to search")
+            .size(11)
+            .color(theme::TEXT_TERTIARY),
     ]
     .spacing(8)
     .align_x(Alignment::Center)
@@ -976,9 +1220,9 @@ fn empty_state() -> Element<'static, Message> {
     .into()
 }
 
-fn divider_style(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(iced::Background::Color(theme::SIDEBAR_DIVIDER)),
+fn divider_style(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(theme::STROKE_SUBTLE)),
         text_color: None,
         border: iced::Border::default(),
         shadow: Default::default(),
@@ -1028,14 +1272,23 @@ fn strip_marks(s: &str) -> String {
     s.replace("<mark>", "").replace("</mark>", "")
 }
 
-fn status_glyph_colored(status: FileStatus) -> (&'static str, iced::Color) {
+/// Maps engine FileStatus to the six-state design-system sync glyph + color.
+/// Returns a function that builds the icon, paired with its tint color.
+fn status_glyph_icon(
+    status: FileStatus,
+) -> (
+    fn(iced::Color) -> iced::widget::svg::Svg<'static, iced::Theme>,
+    iced::Color,
+) {
     match status {
-        FileStatus::Synced => ("\u{25CF}", theme::SUCCESS),
-        FileStatus::PendingUpload => ("\u{25B2}", theme::WARNING),
-        FileStatus::NewLocal => ("\u{25CF}", theme::ACCENT),
-        FileStatus::DeletedPending => ("\u{25CF}", theme::INK_FAINT),
-        FileStatus::Conflict => ("\u{25CF}", theme::ERROR),
-        FileStatus::RemoteOnly => ("\u{25CB}", theme::INK_FAINT),
+        FileStatus::Synced => (icons::check_circle, theme::SYNC_SYNCED),
+        // PendingUpload/NewLocal map to Syncing (violet) per spec derivation.
+        FileStatus::PendingUpload | FileStatus::NewLocal => {
+            (icons::refresh_cw, theme::SYNC_SYNCING)
+        }
+        FileStatus::DeletedPending => (icons::clock, theme::SYNC_QUEUED),
+        FileStatus::Conflict => (icons::alert_triangle, theme::SYNC_CONFLICT),
+        FileStatus::RemoteOnly => (icons::cloud, theme::SYNC_REMOTE),
     }
 }
 
@@ -1200,10 +1453,7 @@ fn activate_cursor(c: &Conn) -> Option<Task<Message>> {
     let idx = c.cursor?;
     match items.get(idx)? {
         Item::Folder(name) => Some(Task::done(Message::Open(name.clone()))),
-        Item::File(key) => Some(Task::batch(vec![
-            Task::done(Message::SelectFile(key.clone())),
-            Task::done(Message::TogglePreview),
-        ])),
+        Item::File(key) => Some(Task::done(Message::SelectFile(key.clone()))),
     }
 }
 
@@ -1217,6 +1467,12 @@ fn map_key(event: keyboard::Event) -> Option<Message> {
     else {
         return None;
     };
+
+    // ⌘K / Ctrl+K opens search palette.
+    if (modifiers.control() || modifiers.command()) && key == Key::Character("k".into()) {
+        return Some(Message::FocusSearch);
+    }
+
     if modifiers.control() || modifiers.command() || modifiers.alt() {
         return None;
     }
@@ -1224,7 +1480,6 @@ fn map_key(event: keyboard::Event) -> Option<Message> {
         Key::Named(Named::Escape) => Some(Message::Escape),
         Key::Named(Named::Backspace) => Some(Message::Backspace),
         Key::Named(Named::Enter) => Some(Message::ActivateCursor),
-        Key::Named(Named::Space) => Some(Message::TogglePreview),
         Key::Character(ref c) => match c.as_str() {
             "/" => Some(Message::FocusSearch),
             "j" => Some(Message::MoveCursor(1)),

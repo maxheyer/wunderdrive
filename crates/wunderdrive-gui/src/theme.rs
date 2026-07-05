@@ -32,6 +32,7 @@ pub const BG_SELECTED: Color = Color::from_rgba(0.545, 0.361, 0.965, 0.14);
 
 pub const STROKE_SUBTLE: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.07);
 pub const STROKE_STRONG: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.14);
+pub const BG_KBD: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.05);
 
 // ---- Text hierarchy ----
 pub const TEXT_PRIMARY: Color = color!(0xEDF0F7);
@@ -311,6 +312,20 @@ pub fn search_pill_container(_theme: &Theme) -> container::Style {
             color: STROKE_SUBTLE,
             width: 1.0,
             radius: border::radius(8.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
+pub fn card_container(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_SURFACE)),
+        text_color: Some(TEXT_PRIMARY),
+        border: Border {
+            color: STROKE_SUBTLE,
+            width: 1.0,
+            radius: border::radius(12.0),
         },
         shadow: Default::default(),
         snap: true,
