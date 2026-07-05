@@ -3,7 +3,7 @@
 use iced::border;
 use iced::theme::Palette;
 use iced::widget::{button, container, scrollable, text_input};
-use iced::{color, Background, Border, Color, Theme};
+use iced::{color, Background, Border, Color, Shadow, Theme, Vector};
 
 pub const INTER: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
 pub const INTER_NAME: &str = "Inter";
@@ -368,6 +368,92 @@ pub fn borderless_input(_theme: &Theme, status: text_input::Status) -> text_inpu
         placeholder: TEXT_TERTIARY,
         value: TEXT_PRIMARY,
         selection: Color { a: 0.3, ..ACCENT },
+    }
+}
+
+// ---- Context menu styles ----
+
+pub fn context_menu_container(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_ELEVATED)),
+        text_color: Some(TEXT_PRIMARY),
+        border: Border {
+            color: STROKE_STRONG,
+            width: 1.0,
+            radius: border::radius(8.0),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+            offset: Vector::new(0.0, 4.0),
+            blur_radius: 12.0,
+        },
+        snap: true,
+    }
+}
+
+pub fn menu_item_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered | button::Status::Pressed => BG_HOVER,
+        _ => Color::TRANSPARENT,
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: TEXT_PRIMARY,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: border::radius(6.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
+pub fn menu_item_disabled(_theme: &Theme, _status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(Background::Color(Color::TRANSPARENT)),
+        text_color: TEXT_TERTIARY,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: border::radius(6.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
+pub fn drop_zone_overlay(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(
+            0.545, 0.361, 0.965, 0.08,
+        ))),
+        text_color: Some(ACCENT_TEXT),
+        border: Border {
+            color: ACCENT,
+            width: 2.0,
+            radius: border::radius(12.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
+pub fn drag_card_container(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(BG_ELEVATED)),
+        text_color: Some(TEXT_PRIMARY),
+        border: Border {
+            color: ACCENT,
+            width: 1.0,
+            radius: border::radius(8.0),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+            offset: Vector::new(0.0, 2.0),
+            blur_radius: 8.0,
+        },
+        snap: true,
     }
 }
 

@@ -51,6 +51,12 @@ icon_fn!(play, "play");
 icon_fn!(chevron_right, "chevron-right");
 icon_fn!(plus, "plus");
 icon_fn!(x, "x");
+icon_fn!(copy, "copy");
+icon_fn!(scissors, "scissors");
+icon_fn!(clipboard_paste, "clipboard-paste");
+icon_fn!(trash, "trash");
+icon_fn!(pencil, "pencil");
+icon_fn!(external_link, "external-link");
 
 /// Type icon for a file key per the v1 mapping:
 /// folder → folder, pdf/doc/txt/md → file-text, images → image, else → file.

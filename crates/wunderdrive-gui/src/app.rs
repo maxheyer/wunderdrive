@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use iced::keyboard::{self, key::Named, Key};
+use iced::keyboard::{self, key::Named, Key, Modifiers};
 use iced::widget::{
-    button, column, container, row, scrollable, space::Space, stack, text, text_input,
+    button, column, container, mouse_area, row, scrollable, space::Space, stack, text, text_input,
 };
-use iced::{Alignment, Element, Length, Subscription, Task};
+use iced::{Alignment, Element, Length, Point, Subscription, Task};
 use wunderdrive_engine::protocol::Resolution;
 use wunderdrive_engine::{ActivityEntry, FileStat, FileStatus, SearchHit, Snapshot, Status};
 
@@ -49,7 +49,8 @@ struct Conn {
     search_hits: Vec<SearchHit>,
     last_error: Option<String>,
     expanded_conflict: Option<String>,
-    selected: Option<String>,
+    selection: BTreeSet<String>,
+    selection_anchor: Option<String>,
     view_mode: ViewMode,
     cursor: Option<usize>,
     first_snapshot: bool,
@@ -57,6 +58,45 @@ struct Conn {
     activity: Vec<ActivityEntry>,
     sync_phase: f32,
     toast: Option<Toast>,
+    context_menu: Option<ContextMenu>,
+    drag: Option<DragState>,
+    file_hover: bool,
+    clipboard_op: Option<ClipboardEntry>,
+    modifiers: Modifiers,
+    cursor_pos: Point,
+}
+
+#[derive(Debug, Clone)]
+struct ContextMenu {
+    position: Point,
+    target: MenuTarget,
+}
+
+#[derive(Debug, Clone)]
+pub enum MenuTarget {
+    FileListBackground,
+    Item(String),
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct DragState {
+    items: Vec<String>,
+    position: Point,
+    origin: Point,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct ClipboardEntry {
+    op: ClipboardOp,
+    keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardOp {
+    Copy,
+    Cut,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +112,7 @@ enum ViewMode {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum Message {
     StatusFetched(Option<Status>, Option<String>),
     SnapshotFetched(Option<Snapshot>, Option<String>),
@@ -99,6 +140,38 @@ pub enum Message {
     ActivityFetched(Vec<ActivityEntry>),
     Tick,
     FontLoaded,
+    // Multi-selection
+    SelectItem(String, SelectionMode),
+    ClearSelection,
+    SelectAll,
+    ModifiersChanged(Modifiers),
+    CursorMoved(Point),
+    // Context menu
+    RightClickedItem(String),
+    RightClickedBackground,
+    OpenContextMenu { target: MenuTarget, position: Point },
+    CloseContextMenu,
+    CopyPath(String),
+    ClipboardCopy,
+    ClipboardCut,
+    ClipboardPaste,
+    // File drag-drop (OS)
+    FileHovered(std::path::PathBuf),
+    FileDropped(std::path::PathBuf),
+    FilesHoveredLeft,
+    // Internal drag
+    DragStarted { items: Vec<String>, origin: Point },
+    DragMoved(Point),
+    DragDroppedOnFolder(String),
+    DragEnded,
+    FolderDropTarget(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    Single,
+    ToggleAdd,
+    Range,
 }
 
 pub fn new() -> (App, Task<Message>) {
@@ -117,7 +190,7 @@ pub fn new() -> (App, Task<Message>) {
 pub fn subscription(_state: &App) -> Subscription<Message> {
     let ticks = iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::Tick);
     let keys = keyboard::listen().filter_map(map_key);
-    let mouse = iced::event::listen_with(map_mouse);
+    let mouse = iced::event::listen_with(map_event);
     Subscription::batch(vec![ticks, keys, mouse])
 }
 
@@ -134,7 +207,8 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 search_hits: Vec::new(),
                 last_error: None,
                 expanded_conflict: None,
-                selected: None,
+                selection: BTreeSet::new(),
+                selection_anchor: None,
                 view_mode: ViewMode::List,
                 cursor: None,
                 first_snapshot: true,
@@ -142,6 +216,12 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 activity: Vec::new(),
                 sync_phase: 0.0,
                 toast: None,
+                context_menu: None,
+                drag: None,
+                file_hover: false,
+                clipboard_op: None,
+                modifiers: Modifiers::default(),
+                cursor_pos: Point::ORIGIN,
             });
             poll_snapshot()
         }
@@ -184,7 +264,9 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                     c.nav_future.clear();
                     c.path.push_str(&name);
                     c.cursor = None;
-                    c.selected = None;
+                    c.selection.clear();
+                    c.selection_anchor = None;
+                    c.context_menu = None;
                     c.screen = Screen::Files;
                 }
             }
@@ -201,7 +283,9 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                         c.path.clear();
                     }
                     c.cursor = None;
-                    c.selected = None;
+                    c.selection.clear();
+                    c.selection_anchor = None;
+                    c.context_menu = None;
                 }
             }
             Task::none()
@@ -212,7 +296,9 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                     c.nav_future.push(c.path.clone());
                     c.path = prev;
                     c.cursor = None;
-                    c.selected = None;
+                    c.selection.clear();
+                    c.selection_anchor = None;
+                    c.context_menu = None;
                 }
             }
             Task::none()
@@ -223,7 +309,9 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                     c.nav_history.push(c.path.clone());
                     c.path = next;
                     c.cursor = None;
-                    c.selected = None;
+                    c.selection.clear();
+                    c.selection_anchor = None;
+                    c.context_menu = None;
                 }
             }
             Task::none()
@@ -292,7 +380,9 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
         }
         Message::SelectFile(key) => {
             if let AppState::Connected(c) = &mut state.state {
-                c.selected = Some(key);
+                c.selection.clear();
+                c.selection.insert(key);
+                c.selection_anchor = c.selection.iter().last().cloned();
             }
             Task::none()
         }
@@ -321,14 +411,17 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
         }
         Message::Escape => {
             if let AppState::Connected(c) = &mut state.state {
-                if !c.search_query.is_empty() {
+                if c.context_menu.is_some() {
+                    c.context_menu = None;
+                } else if !c.search_query.is_empty() {
                     c.search_query.clear();
                     c.search_hits.clear();
                 } else if c.screen == Screen::Search {
                     c.screen = Screen::Files;
                 } else {
                     c.cursor = None;
-                    c.selected = None;
+                    c.selection.clear();
+                    c.selection_anchor = None;
                 }
             }
             Task::none()
@@ -408,6 +501,253 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
             Task::none()
         }
         Message::FontLoaded => Task::none(),
+        // ---- Multi-selection ----
+        Message::SelectItem(key, mode) => {
+            if let AppState::Connected(c) = &mut state.state {
+                match mode {
+                    SelectionMode::Single => {
+                        c.selection.clear();
+                        c.selection.insert(key.clone());
+                        c.selection_anchor = Some(key);
+                    }
+                    SelectionMode::ToggleAdd => {
+                        if c.selection.contains(&key) {
+                            c.selection.remove(&key);
+                        } else {
+                            c.selection.insert(key.clone());
+                        }
+                        c.selection_anchor = Some(key);
+                    }
+                    SelectionMode::Range => {
+                        let items = visible_items(c);
+                        let anchor_key = c.selection_anchor.clone().unwrap_or(key.clone());
+                        let anchor_idx = items.iter().position(|i| match i {
+                            Item::Folder(n) => *n == anchor_key,
+                            Item::File(k) => *k == anchor_key,
+                        });
+                        let target_idx = items.iter().position(|i| match i {
+                            Item::Folder(n) => *n == key,
+                            Item::File(k) => *k == key,
+                        });
+                        if let (Some(a), Some(t)) = (anchor_idx, target_idx) {
+                            let (lo, hi) = if a <= t { (a, t) } else { (t, a) };
+                            c.selection.clear();
+                            for item in &items[lo..=hi] {
+                                if let Item::File(k) = item {
+                                    c.selection.insert(k.clone());
+                                }
+                            }
+                        }
+                        c.selection_anchor = Some(anchor_key);
+                    }
+                }
+                c.context_menu = None;
+            }
+            Task::none()
+        }
+        Message::ClearSelection => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.selection.clear();
+                c.selection_anchor = None;
+                c.context_menu = None;
+            }
+            Task::none()
+        }
+        Message::SelectAll => {
+            if let AppState::Connected(c) = &mut state.state {
+                let (_, files) = split_dirs(&c.snapshot, &c.path);
+                c.selection.clear();
+                for f in &files {
+                    c.selection.insert(f.key.clone());
+                }
+                c.selection_anchor = files.first().map(|f| f.key.clone());
+                c.context_menu = None;
+            }
+            Task::none()
+        }
+        Message::ModifiersChanged(mods) => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.modifiers = mods;
+            }
+            Task::none()
+        }
+        Message::CursorMoved(pos) => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.cursor_pos = pos;
+            }
+            Task::none()
+        }
+        // ---- Context menu ----
+        Message::RightClickedItem(key) => {
+            if let AppState::Connected(c) = &mut state.state {
+                if !c.selection.contains(&key) {
+                    c.selection.clear();
+                    c.selection.insert(key.clone());
+                    c.selection_anchor = Some(key.clone());
+                }
+                c.context_menu = Some(ContextMenu {
+                    position: c.cursor_pos,
+                    target: MenuTarget::Item(key),
+                });
+            }
+            Task::none()
+        }
+        Message::RightClickedBackground => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.context_menu = Some(ContextMenu {
+                    position: c.cursor_pos,
+                    target: MenuTarget::FileListBackground,
+                });
+            }
+            Task::none()
+        }
+        Message::OpenContextMenu { target, position } => {
+            if let AppState::Connected(c) = &mut state.state {
+                // Right-clicking an item not in selection selects just it first
+                if let MenuTarget::Item(ref key) = target {
+                    if !c.selection.contains(key) {
+                        c.selection.clear();
+                        c.selection.insert(key.clone());
+                        c.selection_anchor = Some(key.clone());
+                    }
+                }
+                c.context_menu = Some(ContextMenu { position, target });
+            }
+            Task::none()
+        }
+        Message::CloseContextMenu => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.context_menu = None;
+            }
+            Task::none()
+        }
+        Message::CopyPath(key) => {
+            let path = if let AppState::Connected(c) = &state.state {
+                format!("{}/{}", c.status.local_root, key)
+            } else {
+                String::new()
+            };
+            if let AppState::Connected(c) = &mut state.state {
+                c.context_menu = None;
+            }
+            iced::clipboard::write(path)
+        }
+        Message::ClipboardCopy => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.clipboard_op = Some(ClipboardEntry {
+                    op: ClipboardOp::Copy,
+                    keys: c.selection.iter().cloned().collect(),
+                });
+                c.context_menu = None;
+            }
+            Task::none()
+        }
+        Message::ClipboardCut => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.clipboard_op = Some(ClipboardEntry {
+                    op: ClipboardOp::Cut,
+                    keys: c.selection.iter().cloned().collect(),
+                });
+                c.context_menu = None;
+            }
+            Task::none()
+        }
+        Message::ClipboardPaste => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.context_menu = None;
+                if let Some(entry) = &c.clipboard_op {
+                    let label = match entry.op {
+                        ClipboardOp::Copy => "copy",
+                        ClipboardOp::Cut => "move",
+                    };
+                    let n = entry.keys.len();
+                    // TODO(engine): wire to METHOD_COPY / METHOD_MOVE when added.
+                    c.toast = Some(Toast {
+                        message: format!("Paste {n} item(s) ({label}) — awaiting engine support"),
+                        created_at: std::time::Instant::now(),
+                    });
+                }
+            }
+            Task::none()
+        }
+        // ---- OS file drag-drop ----
+        Message::FileHovered(_) => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.file_hover = true;
+            }
+            Task::none()
+        }
+        Message::FileDropped(path) => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.file_hover = false;
+                // TODO(engine): wire to METHOD_INGEST when added.
+                c.toast = Some(Toast {
+                    message: format!(
+                        "Dropped: {} — ingest awaiting engine support",
+                        path.display()
+                    ),
+                    created_at: std::time::Instant::now(),
+                });
+            }
+            Task::none()
+        }
+        Message::FilesHoveredLeft => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.file_hover = false;
+            }
+            Task::none()
+        }
+        // ---- Internal drag ----
+        Message::DragStarted { items, origin } => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.drag = Some(DragState {
+                    items,
+                    position: origin,
+                    origin,
+                });
+            }
+            Task::none()
+        }
+        Message::DragMoved(pos) => {
+            if let AppState::Connected(c) = &mut state.state {
+                if let Some(d) = &mut c.drag {
+                    d.position = pos;
+                }
+            }
+            Task::none()
+        }
+        Message::DragDroppedOnFolder(folder) => {
+            if let AppState::Connected(c) = &mut state.state {
+                if let Some(d) = c.drag.take() {
+                    let n = d.items.len();
+                    // TODO(engine): wire to METHOD_MOVE when added.
+                    c.toast = Some(Toast {
+                        message: format!("Move {n} item(s) to {folder} — awaiting engine support"),
+                        created_at: std::time::Instant::now(),
+                    });
+                }
+                c.context_menu = None;
+            }
+            Task::none()
+        }
+        Message::DragEnded => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.drag = None;
+            }
+            Task::none()
+        }
+        Message::FolderDropTarget(folder) => {
+            if let AppState::Connected(c) = &mut state.state {
+                if c.drag.take().is_some() {
+                    // TODO(engine): wire to METHOD_MOVE when added.
+                    c.toast = Some(Toast {
+                        message: format!("Move to {folder} — awaiting engine support"),
+                        created_at: std::time::Instant::now(),
+                    });
+                }
+            }
+            Task::none()
+        }
     }
 }
 
@@ -435,26 +775,83 @@ pub fn view(state: &App) -> Element<'_, Message> {
 }
 
 fn main_layout(c: &Conn) -> Element<'_, Message> {
-    let base: Element<'_, Message> = row![sidebar(c), content(c)]
+    let mut layers: Vec<Element<'_, Message>> = vec![row![sidebar(c), content(c)]
         .width(Length::Fill)
         .height(Length::Fill)
-        .into();
+        .into()];
 
-    if let Some(toast) = &c.toast {
-        let toast_layer = container(toast_view(&toast.message))
+    // Drop zone overlay (when OS files hover over the window)
+    if c.file_hover {
+        layers.push(
+            container(
+                column![
+                    icons::cloud(theme::ACCENT),
+                    text("Drop to upload").size(16).color(theme::ACCENT_TEXT),
+                ]
+                .spacing(12)
+                .align_x(Alignment::Center),
+            )
             .width(Length::Fill)
             .height(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Right)
-            .align_y(iced::alignment::Vertical::Bottom)
-            .padding(iced::Padding::new(0.0).bottom(24.0).right(24.0));
-
-        stack![base, toast_layer]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    } else {
-        base
+            .padding(40.0)
+            .center(Length::Fill)
+            .style(theme::drop_zone_overlay)
+            .into(),
+        );
     }
+
+    // Drag overlay (internal item being dragged)
+    if let Some(drag) = &c.drag {
+        let label = if drag.items.len() == 1 {
+            drag.items[0]
+                .rsplit('/')
+                .next()
+                .unwrap_or(&drag.items[0])
+                .to_string()
+        } else {
+            format!("{} items", drag.items.len())
+        };
+        let drag_pos = drag.position;
+        layers.push(
+            container(
+                container(
+                    row![
+                        icons::folder(theme::ACCENT_TEXT),
+                        text(label).size(13).color(theme::TEXT_PRIMARY),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .padding([8, 12])
+                .style(theme::drag_card_container),
+            )
+            .padding(iced::Padding::new(0.0).top(drag_pos.y).left(drag_pos.x))
+            .into(),
+        );
+    }
+
+    // Toast overlay
+    if let Some(toast) = &c.toast {
+        layers.push(
+            container(toast_view(&toast.message))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Right)
+                .align_y(iced::alignment::Vertical::Bottom)
+                .padding(iced::Padding::new(0.0).bottom(24.0).right(24.0))
+                .into(),
+        );
+    }
+
+    // Context menu overlay (top layer)
+    if let Some(menu) = &c.context_menu {
+        layers.push(context_menu_overlay(menu, c));
+    }
+
+    stack(layers)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 fn toast_view(message: &str) -> Element<'static, Message> {
@@ -473,6 +870,167 @@ fn toast_view(message: &str) -> Element<'static, Message> {
     .width(Length::Shrink)
     .max_width(400)
     .into()
+}
+
+// ---- Context menu overlay ----
+
+fn context_menu_overlay<'a>(menu: &'a ContextMenu, c: &'a Conn) -> Element<'a, Message> {
+    // Click-through dismiss layer
+    let dismiss = mouse_area(
+        container(Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .on_press(Message::CloseContextMenu)
+    .on_right_press(Message::CloseContextMenu);
+
+    let items = context_menu_items(&menu.target, c);
+
+    let menu_card = container(column!(items).spacing(1).padding(4))
+        .width(Length::Fixed(200.0))
+        .style(theme::context_menu_container);
+
+    // Position the menu using padding offsets from top-left
+    let pos = menu.position;
+    let positioned = container(menu_card).padding(iced::Padding::new(0.0).top(pos.y).left(pos.x));
+
+    // ponytail: stack dismiss layer + positioned menu card
+    stack![
+        dismiss,
+        mouse_area(positioned).on_press(Message::CloseContextMenu),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+fn context_menu_items<'a>(target: &'a MenuTarget, c: &'a Conn) -> Element<'a, Message> {
+    match target {
+        MenuTarget::FileListBackground => {
+            let mut col = column![].spacing(1);
+            if c.clipboard_op.is_some() {
+                col = col.push(menu_item(
+                    "Paste",
+                    Some(Message::ClipboardPaste),
+                    icons::clipboard_paste(theme::TEXT_SECONDARY),
+                ));
+            } else {
+                col = col.push(menu_item(
+                    "Paste",
+                    None,
+                    icons::clipboard_paste(theme::TEXT_TERTIARY),
+                ));
+            }
+            col = col.push(menu_item(
+                "Select All",
+                Some(Message::SelectAll),
+                icons::check_circle(theme::TEXT_SECONDARY),
+            ));
+            col.into()
+        }
+        MenuTarget::Item(key) => {
+            let is_folder = key.ends_with('/');
+            let is_remote = c
+                .snapshot
+                .files
+                .iter()
+                .any(|f| f.key == *key && f.status == FileStatus::RemoteOnly);
+            let is_conflict = c
+                .snapshot
+                .files
+                .iter()
+                .any(|f| f.key == *key && f.status == FileStatus::Conflict);
+            let multi = c.selection.len() > 1;
+
+            let mut col = column![].spacing(1);
+
+            if !multi {
+                if is_folder {
+                    col = col.push(menu_item(
+                        "Open",
+                        Some(Message::Open(key.clone())),
+                        icons::folder(theme::TEXT_SECONDARY),
+                    ));
+                } else {
+                    // TODO(engine): open with system default app
+                    col = col.push(menu_item(
+                        "Open",
+                        None,
+                        icons::external_link(theme::TEXT_TERTIARY),
+                    ));
+                }
+            }
+
+            if is_remote {
+                col = col.push(menu_item(
+                    "Download",
+                    Some(Message::Materialize(key.clone())),
+                    icons::cloud(theme::TEXT_SECONDARY),
+                ));
+            }
+
+            col = col.push(menu_item(
+                "Copy",
+                Some(Message::ClipboardCopy),
+                icons::copy(theme::TEXT_SECONDARY),
+            ));
+            col = col.push(menu_item(
+                "Cut",
+                Some(Message::ClipboardCut),
+                icons::scissors(theme::TEXT_SECONDARY),
+            ));
+            col = col.push(menu_item(
+                "Copy path",
+                Some(Message::CopyPath(key.clone())),
+                icons::file_text(theme::TEXT_SECONDARY),
+            ));
+
+            if is_conflict {
+                col = col.push(menu_item(
+                    "Resolve conflict",
+                    Some(Message::ToggleConflict(key.clone())),
+                    icons::alert_triangle(theme::SYNC_CONFLICT),
+                ));
+            }
+
+            // TODO(engine): rename + delete need engine IPC
+            col = col.push(menu_item(
+                "Rename",
+                None,
+                icons::pencil(theme::TEXT_TERTIARY),
+            ));
+            col = col.push(menu_item(
+                "Delete",
+                None,
+                icons::trash(theme::TEXT_TERTIARY),
+            ));
+
+            col.into()
+        }
+    }
+}
+
+fn menu_item(
+    label: &str,
+    on_press: Option<Message>,
+    icon: iced::widget::svg::Svg<'static, iced::Theme>,
+) -> Element<'static, Message> {
+    let content = row![
+        icon,
+        text(label.to_string()).size(13).color(theme::TEXT_PRIMARY)
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .padding([6, 10])
+    .width(Length::Fill);
+
+    let mut btn = button(content).width(Length::Fill);
+    if let Some(msg) = on_press {
+        btn = btn.on_press(msg).style(theme::menu_item_button);
+    } else {
+        btn = btn.style(theme::menu_item_disabled);
+    }
+    btn.into()
 }
 
 // ---- Sidebar (design §3.4) ----
@@ -881,6 +1439,8 @@ fn files_body(c: &Conn) -> Element<'_, Message> {
         c.expanded_conflict.as_deref(),
         c.view_mode,
         c.cursor,
+        &c.selection,
+        c.modifiers,
     )
 }
 
@@ -1048,7 +1608,8 @@ fn conflicts_screen(c: &Conn) -> Element<'_, Message> {
             f.mtime_millis,
             f.status,
             is_expanded,
-            false,
+            c.selection.contains(&f.key),
+            c.modifiers,
         ));
     }
     list.into()
@@ -1182,10 +1743,10 @@ fn file_list_view(
     files: &[&FileStat],
     expanded_conflict: Option<&str>,
     view_mode: ViewMode,
-    cursor: Option<usize>,
+    _cursor: Option<usize>,
+    selection: &BTreeSet<String>,
+    modifiers: Modifiers,
 ) -> Element<'static, Message> {
-    let n_folders = folders.len();
-
     let mut list = column![].spacing(2).padding([6, 10]);
 
     if !path.is_empty() {
@@ -1206,25 +1767,31 @@ fn file_list_view(
 
     if view_mode == ViewMode::Grid {
         let mut wrap_row = row![].spacing(8);
-        for (i, name) in folders.iter().enumerate() {
-            wrap_row = wrap_row.push(grid_cell(name, cursor == Some(i)));
+        for name in folders.iter() {
+            wrap_row = wrap_row.push(grid_cell(name, selection.contains(name), modifiers));
         }
-        for (i, f) in files.iter().enumerate() {
+        for f in files.iter() {
             let display = f.key[path.len()..].to_string();
-            let selected = cursor == Some(n_folders + i);
-            wrap_row = wrap_row.push(file_grid_cell(f.key.clone(), display, f.status, selected));
+            let is_selected = selection.contains(&f.key);
+            wrap_row = wrap_row.push(file_grid_cell(
+                f.key.clone(),
+                display,
+                f.status,
+                is_selected,
+                modifiers,
+            ));
         }
         list = list
             .push(wrap_row.wrap().vertical_spacing(8))
             .padding([8, 8]);
     } else {
-        for (i, name) in folders.iter().enumerate() {
-            list = list.push(folder_row(name, cursor == Some(i)));
+        for name in folders.iter() {
+            list = list.push(folder_row(name, selection.contains(name), modifiers));
         }
-        for (i, f) in files.iter().enumerate() {
+        for f in files.iter() {
             let display = f.key[path.len()..].to_string();
             let is_expanded = expanded_conflict == Some(f.key.as_str());
-            let selected = cursor == Some(n_folders + i);
+            let is_selected = selection.contains(&f.key);
             list = list.push(file_row(
                 f.key.clone(),
                 display,
@@ -1232,17 +1799,23 @@ fn file_list_view(
                 f.mtime_millis,
                 f.status,
                 is_expanded,
-                selected,
+                is_selected,
+                modifiers,
             ));
         }
     }
 
-    list.into()
+    // Wrap the list in a mouse_area so clicking empty space clears selection
+    // and right-clicking empty space opens the background context menu.
+    mouse_area(list)
+        .on_press(Message::ClearSelection)
+        .on_right_press(Message::RightClickedBackground)
+        .into()
 }
 
-fn folder_row(name: &str, selected: bool) -> Element<'static, Message> {
+fn folder_row(name: &str, selected: bool, modifiers: Modifiers) -> Element<'static, Message> {
     let display = name.trim_end_matches('/');
-    button(
+    let inner: Element<'static, Message> = button(
         row![
             Space::new().width(Length::Fixed(24.0)),
             icons::folder(theme::ACCENT_TEXT),
@@ -1255,7 +1828,6 @@ fn folder_row(name: &str, selected: bool) -> Element<'static, Message> {
         .spacing(12)
         .align_y(Alignment::Center),
     )
-    .on_press(Message::Open(name.to_string()))
     .width(Length::Fill)
     .height(Length::Fixed(48.0))
     .padding([0, 16])
@@ -1264,12 +1836,24 @@ fn folder_row(name: &str, selected: bool) -> Element<'static, Message> {
     } else {
         theme::row_button
     })
-    .into()
+    .into();
+
+    let key = name.to_string();
+    let key_rc = key.clone();
+    let key_rc2 = key.clone();
+    let key_rc3 = key.clone();
+
+    mouse_area(inner)
+        .on_press(select_message(key, modifiers))
+        .on_double_click(Message::Open(key_rc))
+        .on_right_press(Message::RightClickedItem(key_rc2.clone()))
+        .on_release(Message::FolderDropTarget(key_rc3.clone()))
+        .into()
 }
 
-fn grid_cell(name: &str, selected: bool) -> Element<'static, Message> {
+fn grid_cell(name: &str, selected: bool, modifiers: Modifiers) -> Element<'static, Message> {
     let display = name.trim_end_matches('/');
-    button(
+    let inner: Element<'static, Message> = button(
         column![
             icons::folder(theme::ACCENT_TEXT),
             text(display.to_string())
@@ -1279,7 +1863,6 @@ fn grid_cell(name: &str, selected: bool) -> Element<'static, Message> {
         .spacing(10)
         .align_x(Alignment::Center),
     )
-    .on_press(Message::Open(name.to_string()))
     .width(Length::Fixed(152.0))
     .height(Length::Fixed(152.0))
     .padding([20, 10])
@@ -1288,7 +1871,17 @@ fn grid_cell(name: &str, selected: bool) -> Element<'static, Message> {
     } else {
         theme::grid_cell_button
     })
-    .into()
+    .into();
+
+    let key = name.to_string();
+    let key_rc = key.clone();
+    let key_rc2 = key.clone();
+
+    mouse_area(inner)
+        .on_press(select_message(key, modifiers))
+        .on_double_click(Message::Open(key_rc))
+        .on_right_press(Message::RightClickedItem(key_rc2.clone()))
+        .into()
 }
 
 fn file_grid_cell(
@@ -1296,9 +1889,10 @@ fn file_grid_cell(
     name: String,
     status: FileStatus,
     selected: bool,
+    modifiers: Modifiers,
 ) -> Element<'static, Message> {
     let (glyph, color) = status_glyph_icon(status);
-    let mut btn = button(
+    let inner: Element<'static, Message> = button(
         column![
             icons::type_icon(&key, theme::TEXT_SECONDARY, 56.0),
             text(name).size(12).color(theme::TEXT_PRIMARY),
@@ -1314,13 +1908,22 @@ fn file_grid_cell(
         theme::grid_cell_button_selected
     } else {
         theme::grid_cell_button
-    });
+    })
+    .into();
+
+    let key_rc = key.clone();
+    let key_rc2 = key.clone();
+    let key_rc3 = key.clone();
+
+    let mut area = mouse_area(inner)
+        .on_press(select_message(key_rc, modifiers))
+        .on_right_press(Message::RightClickedItem(key_rc2.clone()));
+
     if status == FileStatus::RemoteOnly {
-        btn = btn.on_press(Message::Materialize(key));
-    } else {
-        btn = btn.on_press(Message::SelectFile(key));
+        area = area.on_double_click(Message::Materialize(key_rc3));
     }
-    btn.into()
+
+    area.into()
 }
 
 fn file_row(
@@ -1331,6 +1934,7 @@ fn file_row(
     status: FileStatus,
     conflict_expanded: bool,
     selected: bool,
+    modifiers: Modifiers,
 ) -> Element<'static, Message> {
     let (glyph_fn, glyph_color) = status_glyph_icon(status);
     let size_text = if status == FileStatus::RemoteOnly {
@@ -1339,7 +1943,7 @@ fn file_row(
         format!("{} \u{00B7} {}", human_size(size), short_date(mtime))
     };
 
-    let mut row_btn = button(
+    let inner: Element<'static, Message> = button(
         row![
             glyph_fn(glyph_color),
             icons::type_icon(&key, theme::TEXT_SECONDARY, 22.0),
@@ -1357,25 +1961,26 @@ fn file_row(
     )
     .width(Length::Fill)
     .height(Length::Fixed(48.0))
-    .padding([0, 16]);
-
-    let style_fn = if selected {
+    .padding([0, 16])
+    .style(if selected {
         theme::selected_row_button
     } else {
         theme::row_button
-    };
-    row_btn = row_btn.style(style_fn);
+    })
+    .into();
 
-    match status {
-        FileStatus::RemoteOnly => {
-            row_btn = row_btn.on_press(Message::Materialize(key.clone()));
-        }
-        FileStatus::Conflict => {
-            row_btn = row_btn.on_press(Message::ToggleConflict(key.clone()));
-        }
-        _ => {
-            row_btn = row_btn.on_press(Message::SelectFile(key.clone()));
-        }
+    let key_rc = key.clone();
+    let key_rc2 = key.clone();
+    let key_rc3 = key.clone();
+
+    let mut area = mouse_area(inner)
+        .on_press(select_message(key_rc, modifiers))
+        .on_right_press(Message::RightClickedItem(key_rc2.clone()));
+
+    if status == FileStatus::RemoteOnly {
+        area = area.on_double_click(Message::Materialize(key_rc3));
+    } else if status == FileStatus::Conflict {
+        area = area.on_double_click(Message::ToggleConflict(key_rc3));
     }
 
     if status == FileStatus::Conflict && conflict_expanded {
@@ -1386,13 +1991,24 @@ fn file_row(
         ]
         .spacing(6)
         .padding(iced::Padding::new(0.0).left(38.0).right(12.0).bottom(6.0));
-        column![conflict_edge(row_btn.into()), actions]
+        column![conflict_edge(area.into()), actions]
             .spacing(1)
             .into()
     } else if status == FileStatus::Conflict {
-        conflict_edge(row_btn.into()).into()
+        conflict_edge(area.into()).into()
     } else {
-        row_btn.into()
+        area.into()
+    }
+}
+
+/// Computes the selection message based on current modifier state.
+fn select_message(key: String, modifiers: Modifiers) -> Message {
+    if modifiers.shift() {
+        Message::SelectItem(key, SelectionMode::Range)
+    } else if modifiers.control() || modifiers.command() {
+        Message::SelectItem(key, SelectionMode::ToggleAdd)
+    } else {
+        Message::SelectItem(key, SelectionMode::Single)
     }
 }
 
@@ -1596,10 +2212,14 @@ fn move_cursor(c: &mut Conn, delta: i32) {
         Some(cur) => ((cur as i32 + delta).rem_euclid(n)) as usize,
     };
     c.cursor = Some(next);
-    c.selected = match &items[next] {
-        Item::Folder(_) => None,
+    c.selection.clear();
+    c.selection_anchor = match &items[next] {
+        Item::Folder(n) => Some(n.clone()),
         Item::File(k) => Some(k.clone()),
     };
+    if let Item::File(k) = &items[next] {
+        c.selection.insert(k.clone());
+    }
 }
 
 fn activate_cursor(c: &Conn) -> Option<Task<Message>> {
@@ -1611,17 +2231,32 @@ fn activate_cursor(c: &Conn) -> Option<Task<Message>> {
     }
 }
 
-fn map_mouse(
+fn map_event(
     event: iced::Event,
     _status: iced::event::Status,
     _window: iced::window::Id,
 ) -> Option<Message> {
-    let iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) = event else {
-        return None;
-    };
-    match button {
-        iced::mouse::Button::Back => Some(Message::NavigateBack),
-        iced::mouse::Button::Forward => Some(Message::NavigateForward),
+    match event {
+        iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) => match button {
+            iced::mouse::Button::Back => Some(Message::NavigateBack),
+            iced::mouse::Button::Forward => Some(Message::NavigateForward),
+            _ => None,
+        },
+        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+            Some(Message::CursorMoved(position))
+        }
+        iced::Event::Keyboard(keyboard::Event::ModifiersChanged(mods)) => {
+            Some(Message::ModifiersChanged(mods))
+        }
+        iced::Event::Window(iced::window::Event::FileHovered(path)) => {
+            Some(Message::FileHovered(path))
+        }
+        iced::Event::Window(iced::window::Event::FileDropped(path)) => {
+            Some(Message::FileDropped(path))
+        }
+        iced::Event::Window(iced::window::Event::FilesHoveredLeft) => {
+            Some(Message::FilesHoveredLeft)
+        }
         _ => None,
     }
 }
@@ -1652,7 +2287,16 @@ fn map_key(event: keyboard::Event) -> Option<Message> {
     }
 
     if modifiers.control() || modifiers.command() {
-        return None;
+        return match key {
+            Key::Character(ref c) => match c.as_str() {
+                "a" => Some(Message::SelectAll),
+                "c" => Some(Message::ClipboardCopy),
+                "x" => Some(Message::ClipboardCut),
+                "v" => Some(Message::ClipboardPaste),
+                _ => None,
+            },
+            _ => None,
+        };
     }
     match key {
         Key::Named(Named::Escape) => Some(Message::Escape),
