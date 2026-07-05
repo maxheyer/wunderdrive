@@ -64,6 +64,7 @@ struct Conn {
     clipboard_op: Option<ClipboardEntry>,
     modifiers: Modifiers,
     cursor_pos: Point,
+    press_origin: Option<Point>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +161,8 @@ pub enum Message {
     FileDropped(std::path::PathBuf),
     FilesHoveredLeft,
     // Internal drag
+    FilePressed(String),
+    MouseReleased,
     DragStarted { items: Vec<String>, origin: Point },
     DragMoved(Point),
     DragDroppedOnFolder(String),
@@ -222,6 +225,7 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 clipboard_op: None,
                 modifiers: Modifiers::default(),
                 cursor_pos: Point::ORIGIN,
+                press_origin: None,
             });
             poll_snapshot()
         }
@@ -574,6 +578,26 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
         Message::CursorMoved(pos) => {
             if let AppState::Connected(c) = &mut state.state {
                 c.cursor_pos = pos;
+                // Detect drag threshold: if we have a press_origin and the
+                // cursor moved > 5px, start a drag with the current selection.
+                if let Some(origin) = c.press_origin {
+                    if c.drag.is_none() {
+                        let dx = pos.x - origin.x;
+                        let dy = pos.y - origin.y;
+                        if (dx * dx + dy * dy).sqrt() > 5.0 {
+                            let items: Vec<String> = c.selection.iter().cloned().collect();
+                            if !items.is_empty() {
+                                c.drag = Some(DragState {
+                                    items,
+                                    position: pos,
+                                    origin,
+                                });
+                            }
+                        }
+                    } else if let Some(d) = &mut c.drag {
+                        d.position = pos;
+                    }
+                }
             }
             Task::none()
         }
@@ -698,6 +722,68 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
             Task::none()
         }
         // ---- Internal drag ----
+        Message::FilePressed(key) => {
+            if let AppState::Connected(c) = &mut state.state {
+                // Apply the same modifier-based selection logic as SelectItem
+                let mode = if c.modifiers.shift() {
+                    SelectionMode::Range
+                } else if c.modifiers.control() || c.modifiers.command() {
+                    SelectionMode::ToggleAdd
+                } else {
+                    SelectionMode::Single
+                };
+                match mode {
+                    SelectionMode::Single => {
+                        c.selection.clear();
+                        c.selection.insert(key.clone());
+                        c.selection_anchor = Some(key.clone());
+                    }
+                    SelectionMode::ToggleAdd => {
+                        if c.selection.contains(&key) {
+                            c.selection.remove(&key);
+                        } else {
+                            c.selection.insert(key.clone());
+                        }
+                        c.selection_anchor = Some(key.clone());
+                    }
+                    SelectionMode::Range => {
+                        let items = visible_items(c);
+                        let anchor_key = c.selection_anchor.clone().unwrap_or(key.clone());
+                        let anchor_idx = items.iter().position(|i| match i {
+                            Item::Folder(n) => *n == anchor_key,
+                            Item::File(k) => *k == anchor_key,
+                        });
+                        let target_idx = items.iter().position(|i| match i {
+                            Item::Folder(n) => *n == key,
+                            Item::File(k) => *k == key,
+                        });
+                        if let (Some(a), Some(t)) = (anchor_idx, target_idx) {
+                            let (lo, hi) = if a <= t { (a, t) } else { (t, a) };
+                            c.selection.clear();
+                            for item in &items[lo..=hi] {
+                                if let Item::File(k) = item {
+                                    c.selection.insert(k.clone());
+                                }
+                            }
+                        }
+                        c.selection_anchor = Some(anchor_key);
+                    }
+                }
+                c.press_origin = Some(c.cursor_pos);
+                c.context_menu = None;
+            }
+            Task::none()
+        }
+        Message::MouseReleased => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.press_origin = None;
+                // If a drag was active and the release didn't hit a folder
+                // (FolderDropTarget would have fired first via mouse_area),
+                // cancel the drag.
+                c.drag = None;
+            }
+            Task::none()
+        }
         Message::DragStarted { items, origin } => {
             if let AppState::Connected(c) = &mut state.state {
                 c.drag = Some(DragState {
@@ -738,10 +824,12 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
         }
         Message::FolderDropTarget(folder) => {
             if let AppState::Connected(c) = &mut state.state {
-                if c.drag.take().is_some() {
+                c.press_origin = None;
+                if let Some(d) = c.drag.take() {
+                    let n = d.items.len();
                     // TODO(engine): wire to METHOD_MOVE when added.
                     c.toast = Some(Toast {
-                        message: format!("Move to {folder} — awaiting engine support"),
+                        message: format!("Move {n} item(s) to {folder} — awaiting engine support"),
                         created_at: std::time::Instant::now(),
                     });
                 }
@@ -1441,6 +1529,7 @@ fn files_body(c: &Conn) -> Element<'_, Message> {
         c.cursor,
         &c.selection,
         c.modifiers,
+        c.drag.is_some(),
     )
 }
 
@@ -1746,6 +1835,7 @@ fn file_list_view(
     _cursor: Option<usize>,
     selection: &BTreeSet<String>,
     modifiers: Modifiers,
+    dragging: bool,
 ) -> Element<'static, Message> {
     let mut list = column![].spacing(2).padding([6, 10]);
 
@@ -1768,7 +1858,12 @@ fn file_list_view(
     if view_mode == ViewMode::Grid {
         let mut wrap_row = row![].spacing(8);
         for name in folders.iter() {
-            wrap_row = wrap_row.push(grid_cell(name, selection.contains(name), modifiers));
+            wrap_row = wrap_row.push(grid_cell(
+                name,
+                selection.contains(name),
+                modifiers,
+                dragging,
+            ));
         }
         for f in files.iter() {
             let display = f.key[path.len()..].to_string();
@@ -1786,7 +1881,12 @@ fn file_list_view(
             .padding([8, 8]);
     } else {
         for name in folders.iter() {
-            list = list.push(folder_row(name, selection.contains(name), modifiers));
+            list = list.push(folder_row(
+                name,
+                selection.contains(name),
+                modifiers,
+                dragging,
+            ));
         }
         for f in files.iter() {
             let display = f.key[path.len()..].to_string();
@@ -1813,7 +1913,12 @@ fn file_list_view(
         .into()
 }
 
-fn folder_row(name: &str, selected: bool, modifiers: Modifiers) -> Element<'static, Message> {
+fn folder_row(
+    name: &str,
+    selected: bool,
+    modifiers: Modifiers,
+    dragging: bool,
+) -> Element<'static, Message> {
     let display = name.trim_end_matches('/');
     let inner: Element<'static, Message> = button(
         row![
@@ -1831,7 +1936,9 @@ fn folder_row(name: &str, selected: bool, modifiers: Modifiers) -> Element<'stat
     .width(Length::Fill)
     .height(Length::Fixed(48.0))
     .padding([0, 16])
-    .style(if selected {
+    .style(if dragging {
+        theme::drop_target_row_button
+    } else if selected {
         theme::selected_row_button
     } else {
         theme::row_button
@@ -1851,7 +1958,12 @@ fn folder_row(name: &str, selected: bool, modifiers: Modifiers) -> Element<'stat
         .into()
 }
 
-fn grid_cell(name: &str, selected: bool, modifiers: Modifiers) -> Element<'static, Message> {
+fn grid_cell(
+    name: &str,
+    selected: bool,
+    modifiers: Modifiers,
+    dragging: bool,
+) -> Element<'static, Message> {
     let display = name.trim_end_matches('/');
     let inner: Element<'static, Message> = button(
         column![
@@ -1866,7 +1978,7 @@ fn grid_cell(name: &str, selected: bool, modifiers: Modifiers) -> Element<'stati
     .width(Length::Fixed(152.0))
     .height(Length::Fixed(152.0))
     .padding([20, 10])
-    .style(if selected {
+    .style(if dragging || selected {
         theme::grid_cell_button_selected
     } else {
         theme::grid_cell_button
@@ -1889,7 +2001,7 @@ fn file_grid_cell(
     name: String,
     status: FileStatus,
     selected: bool,
-    modifiers: Modifiers,
+    _modifiers: Modifiers,
 ) -> Element<'static, Message> {
     let (glyph, color) = status_glyph_icon(status);
     let inner: Element<'static, Message> = button(
@@ -1916,7 +2028,7 @@ fn file_grid_cell(
     let key_rc3 = key.clone();
 
     let mut area = mouse_area(inner)
-        .on_press(select_message(key_rc, modifiers))
+        .on_press(Message::FilePressed(key_rc))
         .on_right_press(Message::RightClickedItem(key_rc2.clone()));
 
     if status == FileStatus::RemoteOnly {
@@ -1934,7 +2046,7 @@ fn file_row(
     status: FileStatus,
     conflict_expanded: bool,
     selected: bool,
-    modifiers: Modifiers,
+    _modifiers: Modifiers,
 ) -> Element<'static, Message> {
     let (glyph_fn, glyph_color) = status_glyph_icon(status);
     let size_text = if status == FileStatus::RemoteOnly {
@@ -1974,7 +2086,7 @@ fn file_row(
     let key_rc3 = key.clone();
 
     let mut area = mouse_area(inner)
-        .on_press(select_message(key_rc, modifiers))
+        .on_press(Message::FilePressed(key_rc))
         .on_right_press(Message::RightClickedItem(key_rc2.clone()));
 
     if status == FileStatus::RemoteOnly {
@@ -2233,7 +2345,7 @@ fn activate_cursor(c: &Conn) -> Option<Task<Message>> {
 
 fn map_event(
     event: iced::Event,
-    _status: iced::event::Status,
+    status: iced::event::Status,
     _window: iced::window::Id,
 ) -> Option<Message> {
     match event {
@@ -2242,6 +2354,16 @@ fn map_event(
             iced::mouse::Button::Forward => Some(Message::NavigateForward),
             _ => None,
         },
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+            // Only end drag if the release wasn't consumed by a widget
+            // (e.g., folder row's on_release fires first and marks the event
+            // as captured, so we skip the fallback clear).
+            if status == iced::event::Status::Ignored {
+                Some(Message::MouseReleased)
+            } else {
+                None
+            }
+        }
         iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
             Some(Message::CursorMoved(position))
         }

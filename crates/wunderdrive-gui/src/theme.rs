@@ -119,6 +119,20 @@ pub fn selected_row_button(_theme: &Theme, _status: button::Status) -> button::S
     }
 }
 
+pub fn drop_target_row_button(_theme: &Theme, _status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(Background::Color(BG_SELECTED)),
+        text_color: ACCENT_TEXT,
+        border: Border {
+            color: ACCENT,
+            width: 1.0,
+            radius: border::radius(8.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
 pub fn grid_cell_button(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
         button::Status::Hovered | button::Status::Pressed => BG_HOVER,
