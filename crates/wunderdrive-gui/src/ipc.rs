@@ -4,9 +4,12 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use interprocess::local_socket::tokio::{prelude::*, Stream};
 use interprocess::local_socket::{GenericNamespaced, ToNsName};
+use serde::de::DeserializeOwned;
 use tokio::io::BufStream;
-use wunderdrive_engine::protocol::{read_msg, write_msg, Request, Response, METHOD_STATUS};
-use wunderdrive_engine::Status;
+use wunderdrive_engine::protocol::{
+    read_msg, write_msg, Request, Response, METHOD_SNAPSHOT, METHOD_STATUS,
+};
+use wunderdrive_engine::{Snapshot, Status};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -15,7 +18,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub async fn fetch_status(socket_name: String) -> Result<Status> {
     for attempt in 0..30 {
         if let Some(mut stream) = try_connect(&socket_name).await {
-            return request_status(&mut stream).await;
+            return request(&mut stream, METHOD_STATUS).await;
         }
         if attempt == 0 {
             spawn_daemon();
@@ -27,16 +30,24 @@ pub async fn fetch_status(socket_name: String) -> Result<Status> {
     Err(anyhow!("could not connect to daemon at '{socket_name}'"))
 }
 
+/// Fetch the current snapshot. Assumes the daemon is already running.
+pub async fn fetch_snapshot(socket_name: String) -> Result<Snapshot> {
+    let mut stream = try_connect(&socket_name)
+        .await
+        .context("daemon not running")?;
+    request(&mut stream, METHOD_SNAPSHOT).await
+}
+
 async fn try_connect(socket_name: &str) -> Option<BufStream<Stream>> {
     let name = socket_name.to_ns_name::<GenericNamespaced>().ok()?;
     Stream::connect(name).await.ok().map(BufStream::new)
 }
 
-async fn request_status(stream: &mut BufStream<Stream>) -> Result<Status> {
+async fn request<T: DeserializeOwned>(stream: &mut BufStream<Stream>, method: &str) -> Result<T> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let req = Request {
         id,
-        method: METHOD_STATUS.into(),
+        method: method.into(),
         params: serde_json::Value::Null,
     };
     write_msg(stream, &req).await?;
@@ -47,7 +58,7 @@ async fn request_status(stream: &mut BufStream<Stream>) -> Result<Status> {
         return Err(anyhow!("daemon: {e}"));
     }
     let val = resp.result.unwrap_or(serde_json::Value::Null);
-    serde_json::from_value(val).context("decode status")
+    serde_json::from_value(val).context("decode")
 }
 
 fn spawn_daemon() {

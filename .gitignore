@@ -4,3 +4,6 @@ target/
 # Nix detritus
 .direnv/
 result
+
+# Scratch
+spaceui/
