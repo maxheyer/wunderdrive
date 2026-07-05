@@ -7,9 +7,11 @@ use interprocess::local_socket::{GenericNamespaced, ToNsName};
 use serde::de::DeserializeOwned;
 use tokio::io::BufStream;
 use wunderdrive_engine::protocol::{
-    read_msg, write_msg, Request, Response, METHOD_SNAPSHOT, METHOD_STATUS,
+    read_msg, write_msg, Request, Resolution, Response, METHOD_MATERIALIZE, METHOD_PAUSE,
+    METHOD_RESOLVE_CONFLICT, METHOD_RESUME, METHOD_SEARCH, METHOD_SNAPSHOT, METHOD_STATUS,
+    METHOD_SYNC_NOW,
 };
-use wunderdrive_engine::{Snapshot, Status};
+use wunderdrive_engine::{SearchHit, Snapshot, Status};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -18,7 +20,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub async fn fetch_status(socket_name: String) -> Result<Status> {
     for attempt in 0..30 {
         if let Some(mut stream) = try_connect(&socket_name).await {
-            return request(&mut stream, METHOD_STATUS).await;
+            return request_with_params(&mut stream, METHOD_STATUS, serde_json::Value::Null).await;
         }
         if attempt == 0 {
             spawn_daemon();
@@ -35,7 +37,62 @@ pub async fn fetch_snapshot(socket_name: String) -> Result<Snapshot> {
     let mut stream = try_connect(&socket_name)
         .await
         .context("daemon not running")?;
-    request(&mut stream, METHOD_SNAPSHOT).await
+    request_with_params(&mut stream, METHOD_SNAPSHOT, serde_json::Value::Null).await
+}
+
+/// Full-text search the index.
+pub async fn search(socket_name: String, query: String, limit: usize) -> Result<Vec<SearchHit>> {
+    let mut stream = try_connect(&socket_name)
+        .await
+        .context("daemon not running")?;
+    let params = serde_json::json!({ "query": query, "limit": limit });
+    request_with_params(&mut stream, METHOD_SEARCH, params).await
+}
+
+/// Trigger an immediate sync cycle.
+pub async fn sync_now(socket_name: String) -> Result<()> {
+    let mut stream = try_connect(&socket_name)
+        .await
+        .context("daemon not running")?;
+    request_with_params(&mut stream, METHOD_SYNC_NOW, serde_json::Value::Null).await
+}
+
+/// Pause the sync loop.
+pub async fn pause(socket_name: String) -> Result<()> {
+    let mut stream = try_connect(&socket_name)
+        .await
+        .context("daemon not running")?;
+    request_with_params(&mut stream, METHOD_PAUSE, serde_json::Value::Null).await
+}
+
+/// Resume the sync loop.
+pub async fn resume(socket_name: String) -> Result<()> {
+    let mut stream = try_connect(&socket_name)
+        .await
+        .context("daemon not running")?;
+    request_with_params(&mut stream, METHOD_RESUME, serde_json::Value::Null).await
+}
+
+/// Download a remote-only object into the local mirror.
+pub async fn materialize(socket_name: String, key: String) -> Result<()> {
+    let mut stream = try_connect(&socket_name)
+        .await
+        .context("daemon not running")?;
+    let params = serde_json::json!({ "key": key });
+    request_with_params(&mut stream, METHOD_MATERIALIZE, params).await
+}
+
+/// Resolve a both-sides conflict.
+pub async fn resolve_conflict(
+    socket_name: String,
+    key: String,
+    resolution: Resolution,
+) -> Result<()> {
+    let mut stream = try_connect(&socket_name)
+        .await
+        .context("daemon not running")?;
+    let params = serde_json::json!({ "key": key, "resolution": resolution });
+    request_with_params(&mut stream, METHOD_RESOLVE_CONFLICT, params).await
 }
 
 async fn try_connect(socket_name: &str) -> Option<BufStream<Stream>> {
@@ -43,12 +100,16 @@ async fn try_connect(socket_name: &str) -> Option<BufStream<Stream>> {
     Stream::connect(name).await.ok().map(BufStream::new)
 }
 
-async fn request<T: DeserializeOwned>(stream: &mut BufStream<Stream>, method: &str) -> Result<T> {
+async fn request_with_params<T: DeserializeOwned>(
+    stream: &mut BufStream<Stream>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<T> {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let req = Request {
         id,
         method: method.into(),
-        params: serde_json::Value::Null,
+        params,
     };
     write_msg(stream, &req).await?;
     let resp: Response = read_msg(stream)

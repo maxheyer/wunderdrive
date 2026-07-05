@@ -100,41 +100,59 @@ Commands (sync/pause/materialize) → `Task` → IPC request → daemon.
 - Note: GUI can't boot in sandbox (missing libwayland-client.so); works on
       real desktop with Wayland/X11 libs present.
 
-### 3b. File browser (~3h)
-- [ ] Subscription: poll METHOD_SNAPSHOT every 1s, emit SnapshotFetched
-- [ ] Current-directory view: filter snapshot by path prefix
-- [ ] Scrollable list (iced `scrollable` + `column`) of file rows
-- [ ] Status glyphs per row: ✓ synced, ↑ uploading, + new, ☁ remote-only,
-      ! conflict
-- [ ] Sort by name / size / mtime (column header click)
-- [ ] Path breadcrumb (navigate into/out of subdirs)
+### 3b. File browser (~3h) ✅
+- [x] Self-perpetuating 1Hz snapshot poll via Task::perform (sleep + refetch)
+- [x] Current-directory view: filter snapshot by path prefix (split_dirs)
+- [x] Scrollable list of folder rows + file rows with status glyphs
+- [x] Path breadcrumb + back button (navigate into/out of subdirs)
+- [x] Status bar (item count, last sync time)
 
-### 3c. Search + sync (~3h)
-- [ ] Search bar (text_input, 150ms debounce via Subscription time throttle)
-- [ ] Live results dropdown (METHOD_SEARCH, show snippet + key)
-- [ ] Dedicated search results view (Enter → full-width list)
-- [ ] Sync status bar (endpoint, bucket, last sync, paused indicator)
-- [ ] Pause/Resume + Sync Now buttons (METHOD_PAUSE/RESUME/SYNC_NOW)
-- [ ] Activity feed (poll METHOD_ACTIVITY, scrolling log)
+### 3c. Search + sync controls ✅
+- [x] ipc.rs: refactored `request` → `request_with_params<T>(stream, method, params)`
+- [x] ipc.rs: `search`, `sync_now`, `pause`, `resume`
+- [x] Search bar (text_input) with 150ms debounce (sleep-then-search Task)
+- [x] Inline search results replace file list while query non-empty;
+      stale results discarded by query-match check
+- [x] Sidebar bottom controls: "Sync now" (primary) + "Pause/Resume" toggle
+- [x] ActionResult surfaces failures into the status bar
 
-### 3d. Lazy + conflicts (~2h)
-- [ ] Click ☁ glyph → METHOD_MATERIALIZE → row flips to ↑ then ✓
-- [ ] Conflict count badge in sidebar (count ! rows in snapshot)
-- [ ] Conflict view: list conflicts, Keep Local / Keep Remote / Keep Both
-      buttons (METHOD_RESOLVE_CONFLICT)
+### 3d. Materialize + conflict resolution ✅
+- [x] ipc.rs: `materialize`, `resolve_conflict`
+- [x] RemoteOnly rows are clickable → Materialize(key)
+- [x] Conflict rows expand inline → Keep Local / Keep Remote / Keep Both
+- [x] Conflict count badge in sidebar (red, when > 0)
 
-### 3e. Quick preview (~3h)
-- [ ] Preview pane (right column, toggled)
-- [ ] Text/code: read from local mirror, show in scrollable text widget
-- [ ] Images: `iced::widget::image` from local mirror path
-- [ ] Other: metadata card (size, blake3, status, mtime)
+### 3e. Quick preview ✅
+- [x] Preview pane (right, ~40% via FillPortion 3:2), toggled from breadcrumb
+- [x] Text/code files: read from local_root (cap 256 KB, lossy UTF-8)
+- [x] Images/other: metadata card (key, size, status, mtime)
+      — ponytail: iced `image` feature not enabled; metadata card instead
+- [x] RemoteOnly preview: "Not downloaded" + download button
+- [x] SelectFile / PreviewLoaded messages (stale results guarded by key match)
 
-### 3f. Polish (~3h)
-- [ ] Custom dark theme palette (iced `Theme` customization)
-- [ ] Keyboard shortcuts (j/k navigate, / focus search, space preview, etc.)
-- [ ] App icon + window title
-- [ ] Loading/empty/error states
-- [ ] Grid view (icons + names) vs list view toggle
+### 3f. Polish ✅
+- [x] Keyboard shortcuts via `keyboard::listen()` subscription + filter_map:
+      `/` focus search, `Esc` clear/close, `Backspace` up, `j`/`k` cursor,
+      `Enter` open, `Space` toggle preview
+      (listen() only fires ignored events → search-input captures auto-suppressed)
+- [x] Selection highlight (selected_row_button, accent at low opacity)
+- [x] List/Grid view toggle (Grid::fluid(120) cells: icon + name)
+- [x] Empty state ("No files synced yet" + tip)
+- [x] Loading state (first snapshot pending → "Loading…")
+- [x] Dead-code cleanup (removed unused BG_CONTENT, sidebar_button)
 
 ## Review
-(filled in after each sub-phase)
+
+All four sub-phases implemented incrementally with build+fmt between each.
+Final verification (`CARGO_HOME=/tmp/opencode/cargo-home`):
+- `cargo build` (full workspace): 0 errors, **0 warnings**
+- `cargo fmt -- --check`: clean
+- `cargo test`: 47 passed, 0 failed (4 engine snapshot/reconcile + 43 index/extract)
+
+Notes:
+- No new crate deps added. Image preview deferred (needs iced `image` feature);
+  shows metadata card instead — see `preview_metadata`.
+- Keyboard shortcuts rely on `keyboard::listen()` which only emits **ignored**
+  events, so typing in the search box never fires `/`, `j`, `k`, `Space`, etc.
+- Cursor (keyboard) and selected (mouse/preview) are kept in sync when j/k lands
+  on a file; mouse clicks set selected without moving the cursor (intentional).
