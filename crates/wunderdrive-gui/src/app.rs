@@ -432,7 +432,13 @@ fn sidebar(c: &Conn) -> Element<'_, Message> {
 
     container(
         column![
-            container(header).padding(iced::Padding::new(0.0).top(20).right(20).bottom(12).left(20)),
+            container(header).padding(
+                iced::Padding::new(0.0)
+                    .top(20)
+                    .right(20)
+                    .bottom(12)
+                    .left(20)
+            ),
             Space::new().height(Length::Fill),
             container(
                 column![
@@ -443,7 +449,13 @@ fn sidebar(c: &Conn) -> Element<'_, Message> {
                 ]
                 .spacing(12)
             )
-            .padding(iced::Padding::new(0.0).top(0.0).right(16).bottom(20).left(16)),
+            .padding(
+                iced::Padding::new(0.0)
+                    .top(0.0)
+                    .right(16)
+                    .bottom(20)
+                    .left(16)
+            ),
         ]
         .height(Length::Fill),
     )
@@ -479,8 +491,17 @@ fn content(c: &Conn) -> Element<'_, Message> {
 
     container(
         column![
-            top_bar(&c.status, &c.path, &c.search_query, searching, c.view_mode, c.show_preview),
-            scrollable(body).height(Length::Fill).style(theme::thin_scrollable),
+            top_bar(
+                &c.status,
+                &c.path,
+                &c.search_query,
+                searching,
+                c.view_mode,
+                c.show_preview
+            ),
+            scrollable(body)
+                .height(Length::Fill)
+                .style(theme::thin_scrollable),
             status_bar(total, &c.status, c.last_error.as_deref()),
         ]
         .height(Length::Fill),
@@ -523,9 +544,7 @@ fn top_bar<'a>(
                 })
                 .padding([6, 10])
                 .style(theme::icon_button),
-            text(breadcrumb_text)
-                .size(13)
-                .color(theme::INK_DULL),
+            text(breadcrumb_text).size(13).color(theme::INK_DULL),
             Space::new().width(Length::Fill),
             search_pill(query),
             button(text(view_label.to_string()).size(11))
@@ -679,7 +698,10 @@ fn folder_row(name: &str, selected: bool) -> Element<'static, Message> {
     let display = name.trim_end_matches('/');
     button(
         row![
-            text("\u{25B8}").size(14).color(theme::ACCENT).width(Length::Fixed(20.0)),
+            text("\u{25B8}")
+                .size(14)
+                .color(theme::ACCENT)
+                .width(Length::Fixed(20.0)),
             text(display.to_string()).size(13),
         ]
         .spacing(6)
@@ -836,7 +858,9 @@ fn preview_pane(c: &Conn) -> Element<'_, Message> {
     container(
         column![
             preview_header(c.selected.as_deref()),
-            scrollable(body).height(Length::Fill).style(theme::thin_scrollable),
+            scrollable(body)
+                .height(Length::Fill)
+                .style(theme::thin_scrollable),
         ]
         .height(Length::Fill),
     )
@@ -868,7 +892,9 @@ fn preview_header(selected: Option<&str>) -> Element<'static, Message> {
 fn preview_remote_only(f: &FileStat) -> Element<'static, Message> {
     column![
         text("Not downloaded").size(14).color(theme::INK_DULL),
-        text("This file exists only in the remote bucket.").size(12).color(theme::INK_FAINT),
+        text("This file exists only in the remote bucket.")
+            .size(12)
+            .color(theme::INK_FAINT),
         button(text("Download now").size(12))
             .on_press(Message::Materialize(f.key.clone()))
             .padding([6, 14])
@@ -884,9 +910,7 @@ fn preview_text<'a>(
     preview: Option<&'a (String, PreviewContent)>,
 ) -> Element<'a, Message> {
     match preview {
-        Some((k, PreviewContent::Text(s))) if k == key => {
-            text(s.clone()).size(12).into()
-        }
+        Some((k, PreviewContent::Text(s))) if k == key => text(s.clone()).size(12).into(),
         Some((k, PreviewContent::Error(e))) if k == key => {
             text(format!("Could not read file: {e}"))
                 .size(12)
@@ -944,9 +968,7 @@ fn empty_state() -> Element<'static, Message> {
         text("Drop files into your local mirror folder, or sync the remote bucket.")
             .size(12)
             .color(theme::INK_DULL),
-        text("Press / to search")
-            .size(11)
-            .color(theme::INK_FAINT),
+        text("Press / to search").size(11).color(theme::INK_FAINT),
     ]
     .spacing(8)
     .align_x(Alignment::Center)
@@ -965,10 +987,7 @@ fn divider_style(_theme: &iced::Theme) -> container::Style {
 }
 
 fn status_dot(color: iced::Color) -> Element<'static, Message> {
-    text("\u{25CF}")
-        .size(8.0)
-        .color(color)
-        .into()
+    text("\u{25CF}").size(8.0).color(color).into()
 }
 
 // ---- helpers ----

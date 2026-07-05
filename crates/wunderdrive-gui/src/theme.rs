@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use iced::border;
 use iced::theme::Palette;
 use iced::widget::{button, container, scrollable, text_input};
@@ -5,8 +7,7 @@ use iced::{color, Background, Border, Color, Theme};
 
 pub const INTER: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
 pub const INTER_NAME: &str = "Inter";
-pub const JETBRAINS_MONO: &[u8] =
-    include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
+pub const JETBRAINS_MONO: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
 pub const MONO_NAME: &str = "JetBrains Mono";
 
 pub fn mono_font() -> iced::Font {
@@ -16,67 +17,87 @@ pub fn mono_font() -> iced::Font {
     }
 }
 
+// ============================================================================
+// TOKENS — single source of truth (design system §3.1)
+// No hex literals belong anywhere outside this block.
+// ============================================================================
+
+// ---- Surfaces & strokes ----
+pub const BG_APP: Color = color!(0x0B0D13);
+pub const BG_SIDEBAR: Color = color!(0x0E1119);
+pub const BG_SURFACE: Color = color!(0x151A26);
+pub const BG_ELEVATED: Color = color!(0x1B2233);
+pub const BG_HOVER: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.04);
+pub const BG_SELECTED: Color = Color::from_rgba(0.545, 0.361, 0.965, 0.14);
+
+pub const STROKE_SUBTLE: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.07);
+pub const STROKE_STRONG: Color = Color::from_rgba(1.0, 1.0, 1.0, 0.14);
+
+// ---- Text hierarchy ----
+pub const TEXT_PRIMARY: Color = color!(0xEDF0F7);
+pub const TEXT_SECONDARY: Color = color!(0x9AA3B8);
+pub const TEXT_TERTIARY: Color = color!(0x5D6579);
+pub const TEXT_ON_ACCENT: Color = color!(0xFFFFFF);
+
+// ---- Accent (violet) ----
+pub const ACCENT: Color = color!(0x8B5CF6);
+pub const ACCENT_HOVER: Color = color!(0xA78BFA);
+pub const ACCENT_ACTIVE: Color = color!(0x7C3AED);
+pub const ACCENT_TEXT: Color = color!(0xC4B5FD);
+pub const ACCENT_TINT: Color = Color::from_rgba(0.545, 0.361, 0.965, 0.14);
+
+// ---- Sync-state language (design system §3.2) ----
+pub const SYNC_SYNCED: Color = color!(0x34D399);
+pub const SYNC_SYNCING: Color = ACCENT;
+pub const SYNC_QUEUED: Color = color!(0x7B8496);
+pub const SYNC_CONFLICT: Color = color!(0xFBBF24);
+pub const SYNC_ERROR: Color = color!(0xF87171);
+pub const SYNC_REMOTE: Color = color!(0x38BDF8);
+
+// ---- Legacy aliases (map old names → new tokens, removed as views migrate) ----
+// Only the names still referenced from app.rs are kept.
+pub const INK_DULL: Color = TEXT_SECONDARY;
+pub const INK_FAINT: Color = TEXT_TERTIARY;
+pub const SUCCESS: Color = SYNC_SYNCED;
+pub const WARNING: Color = SYNC_CONFLICT;
+pub const ERROR: Color = SYNC_ERROR;
+pub const SIDEBAR_DIVIDER: Color = STROKE_SUBTLE;
+pub const SCROLLBAR_THUMB: Color = color!(0x393948);
+
+// ---- Theme ----
+
 pub fn theme() -> Theme {
     Theme::custom(
-        "WunderDark",
+        "Wunderdrive Dark",
         Palette {
-            background: APP,
-            text: INK,
+            background: BG_APP,
+            text: TEXT_PRIMARY,
             primary: ACCENT,
-            success: SUCCESS,
-            warning: WARNING,
-            danger: ERROR,
+            success: SYNC_SYNCED,
+            warning: SYNC_CONFLICT,
+            danger: SYNC_ERROR,
         },
     )
 }
 
-// App surfaces (hue 235, blue-tinted darks)
-pub const APP: Color = color!(0x1C1D26);
-pub const APP_BOX: Color = color!(0x272835);
-pub const APP_DARK_BOX: Color = color!(0x21222B);
-pub const APP_INPUT: Color = color!(0x2C2D3B);
-pub const APP_HOVER: Color = color!(0x292A37);
-pub const APP_SELECTED: Color = color!(0x353646);
-pub const APP_LINE: Color = color!(0x323343);
-pub const APP_OVERLAY: Color = color!(0x252632);
-
-// Sidebar (darkest surface)
-pub const SIDEBAR: Color = color!(0x0F1015);
-pub const SIDEBAR_BOX: Color = color!(0x232430);
-pub const SIDEBAR_DIVIDER: Color = color!(0x252632);
-pub const SIDEBAR_BUTTON: Color = color!(0x272835);
-
-// Accent
-pub const ACCENT: Color = color!(0x2599FF);
-pub const ACCENT_FAINT: Color = color!(0x5DB4FF);
-
-// Text hierarchy
-pub const INK: Color = color!(0xE4E5F2);
-pub const INK_DULL: Color = color!(0xABACBA);
-pub const INK_FAINT: Color = color!(0x818398);
-
-// Status
-pub const SUCCESS: Color = color!(0x16A34A);
-pub const WARNING: Color = color!(0xFBA517);
-pub const ERROR: Color = color!(0xE5484D);
-
-// Scrollbar
-pub const SCROLLBAR_THUMB: Color = color!(0x393948);
+// ============================================================================
+// STYLES — closure-based styling per iced 0.14 API
+// ============================================================================
 
 // ---- Button styles ----
 
 pub fn row_button(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
-        button::Status::Hovered | button::Status::Pressed => APP_HOVER,
+        button::Status::Hovered | button::Status::Pressed => BG_HOVER,
         _ => Color::TRANSPARENT,
     };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: INK,
+        text_color: TEXT_PRIMARY,
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
-            radius: border::radius(6.0),
+            radius: border::radius(8.0),
         },
         shadow: Default::default(),
         snap: true,
@@ -85,12 +106,12 @@ pub fn row_button(_theme: &Theme, status: button::Status) -> button::Style {
 
 pub fn selected_row_button(_theme: &Theme, _status: button::Status) -> button::Style {
     button::Style {
-        background: Some(Background::Color(APP_SELECTED)),
-        text_color: INK,
+        background: Some(Background::Color(BG_SELECTED)),
+        text_color: TEXT_PRIMARY,
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
-            radius: border::radius(6.0),
+            radius: border::radius(8.0),
         },
         shadow: Default::default(),
         snap: true,
@@ -99,14 +120,14 @@ pub fn selected_row_button(_theme: &Theme, _status: button::Status) -> button::S
 
 pub fn grid_cell_button(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
-        button::Status::Hovered | button::Status::Pressed => APP_HOVER,
-        _ => APP_BOX,
+        button::Status::Hovered | button::Status::Pressed => BG_HOVER,
+        _ => BG_SURFACE,
     };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: INK,
+        text_color: TEXT_PRIMARY,
         border: Border {
-            color: APP_LINE,
+            color: STROKE_SUBTLE,
             width: 1.0,
             radius: border::radius(8.0),
         },
@@ -117,8 +138,8 @@ pub fn grid_cell_button(_theme: &Theme, status: button::Status) -> button::Style
 
 pub fn grid_cell_button_selected(_theme: &Theme, _status: button::Status) -> button::Style {
     button::Style {
-        background: Some(Background::Color(APP_SELECTED)),
-        text_color: INK,
+        background: Some(Background::Color(BG_SELECTED)),
+        text_color: TEXT_PRIMARY,
         border: Border {
             color: ACCENT,
             width: 1.0,
@@ -132,15 +153,17 @@ pub fn grid_cell_button_selected(_theme: &Theme, _status: button::Status) -> but
 pub fn primary_button(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
         button::Status::Disabled => Color { a: 0.4, ..ACCENT },
+        button::Status::Hovered => ACCENT_HOVER,
+        button::Status::Pressed => ACCENT_ACTIVE,
         _ => ACCENT,
     };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: color!(0xFFFFFF),
+        text_color: TEXT_ON_ACCENT,
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
-            radius: border::radius(6.0),
+            radius: border::radius(8.0),
         },
         shadow: Default::default(),
         snap: true,
@@ -149,20 +172,20 @@ pub fn primary_button(_theme: &Theme, status: button::Status) -> button::Style {
 
 pub fn gray_button(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
-        button::Status::Hovered | button::Status::Pressed => APP_HOVER,
-        _ => SIDEBAR_BUTTON,
+        button::Status::Hovered | button::Status::Pressed => BG_HOVER,
+        _ => BG_SURFACE,
     };
     let border_color = match status {
-        button::Status::Hovered | button::Status::Pressed => APP_LINE,
-        _ => Color { a: 0.5, ..APP_LINE },
+        button::Status::Hovered | button::Status::Pressed => STROKE_STRONG,
+        _ => STROKE_SUBTLE,
     };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: INK,
+        text_color: TEXT_PRIMARY,
         border: Border {
             color: border_color,
             width: 1.0,
-            radius: border::radius(6.0),
+            radius: border::radius(8.0),
         },
         shadow: Default::default(),
         snap: true,
@@ -171,18 +194,16 @@ pub fn gray_button(_theme: &Theme, status: button::Status) -> button::Style {
 
 pub fn subtle_button(_theme: &Theme, status: button::Status) -> button::Style {
     let (bg, border_color) = match status {
-        button::Status::Hovered | button::Status::Pressed => {
-            (Color::TRANSPARENT, APP_LINE)
-        }
+        button::Status::Hovered | button::Status::Pressed => (Color::TRANSPARENT, STROKE_STRONG),
         _ => (Color::TRANSPARENT, Color::TRANSPARENT),
     };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: INK_DULL,
+        text_color: TEXT_SECONDARY,
         border: Border {
             color: border_color,
             width: 1.0,
-            radius: border::radius(6.0),
+            radius: border::radius(8.0),
         },
         shadow: Default::default(),
         snap: true,
@@ -191,16 +212,16 @@ pub fn subtle_button(_theme: &Theme, status: button::Status) -> button::Style {
 
 pub fn icon_button(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
-        button::Status::Hovered | button::Status::Pressed => APP_HOVER,
+        button::Status::Hovered | button::Status::Pressed => BG_HOVER,
         _ => Color::TRANSPARENT,
     };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: INK_DULL,
+        text_color: TEXT_SECONDARY,
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
-            radius: border::radius(6.0),
+            radius: border::radius(8.0),
         },
         shadow: Default::default(),
         snap: true,
@@ -211,10 +232,10 @@ pub fn icon_button(_theme: &Theme, status: button::Status) -> button::Style {
 
 pub fn sidebar_container(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(SIDEBAR)),
-        text_color: Some(INK),
+        background: Some(Background::Color(BG_SIDEBAR)),
+        text_color: Some(TEXT_PRIMARY),
         border: Border {
-            color: APP_LINE,
+            color: STROKE_SUBTLE,
             width: 0.0,
             radius: border::radius(0.0),
         },
@@ -225,10 +246,10 @@ pub fn sidebar_container(_theme: &Theme) -> container::Style {
 
 pub fn top_bar_container(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(APP)),
-        text_color: Some(INK),
+        background: Some(Background::Color(BG_APP)),
+        text_color: Some(TEXT_PRIMARY),
         border: Border {
-            color: APP_LINE,
+            color: STROKE_SUBTLE,
             width: 0.0,
             radius: border::radius(0.0),
         },
@@ -239,10 +260,10 @@ pub fn top_bar_container(_theme: &Theme) -> container::Style {
 
 pub fn status_bar_container(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(APP)),
-        text_color: Some(INK_DULL),
+        background: Some(Background::Color(BG_APP)),
+        text_color: Some(TEXT_SECONDARY),
         border: Border {
-            color: APP_LINE,
+            color: STROKE_SUBTLE,
             width: 1.0,
             radius: border::radius(0.0),
         },
@@ -253,8 +274,11 @@ pub fn status_bar_container(_theme: &Theme) -> container::Style {
 
 pub fn badge_container(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(Color { a: 0.2, ..ERROR })),
-        text_color: Some(ERROR),
+        background: Some(Background::Color(Color {
+            a: 0.2,
+            ..SYNC_CONFLICT
+        })),
+        text_color: Some(SYNC_CONFLICT),
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
@@ -267,10 +291,10 @@ pub fn badge_container(_theme: &Theme) -> container::Style {
 
 pub fn preview_container(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(APP_DARK_BOX)),
-        text_color: Some(INK),
+        background: Some(Background::Color(BG_ELEVATED)),
+        text_color: Some(TEXT_PRIMARY),
         border: Border {
-            color: APP_LINE,
+            color: STROKE_SUBTLE,
             width: 1.0,
             radius: border::radius(0.0),
         },
@@ -281,12 +305,12 @@ pub fn preview_container(_theme: &Theme) -> container::Style {
 
 pub fn search_pill_container(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(APP_OVERLAY)),
-        text_color: Some(INK),
+        background: Some(Background::Color(BG_SURFACE)),
+        text_color: Some(TEXT_PRIMARY),
         border: Border {
-            color: Color { a: 0.3, ..APP_LINE },
+            color: STROKE_SUBTLE,
             width: 1.0,
-            radius: border::radius(999.0),
+            radius: border::radius(8.0),
         },
         shadow: Default::default(),
         snap: true,
@@ -303,9 +327,9 @@ pub fn borderless_input(_theme: &Theme, _status: text_input::Status) -> text_inp
             width: 0.0,
             radius: border::radius(0.0),
         },
-        icon: INK_FAINT,
-        placeholder: INK_FAINT,
-        value: INK,
+        icon: TEXT_TERTIARY,
+        placeholder: TEXT_TERTIARY,
+        value: TEXT_PRIMARY,
         selection: Color { a: 0.3, ..ACCENT },
     }
 }
@@ -356,7 +380,7 @@ pub fn thin_scrollable(_theme: &Theme, _status: scrollable::Status) -> scrollabl
                 radius: border::radius(0.0),
             },
             shadow: Default::default(),
-            icon: INK_FAINT,
+            icon: TEXT_TERTIARY,
         },
     }
 }
