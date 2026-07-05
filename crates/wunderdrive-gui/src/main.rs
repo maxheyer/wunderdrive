@@ -7,5 +7,9 @@ fn main() -> iced::Result {
         .subscription(app::subscription)
         .title(|_: &app::App| String::from("wunderdrive"))
         .theme(|_: &app::App| theme::theme())
+        .default_font(iced::Font {
+            family: iced::font::Family::Name(theme::INTER_NAME),
+            ..iced::Font::DEFAULT
+        })
         .run()
 }

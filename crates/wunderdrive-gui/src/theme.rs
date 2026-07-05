@@ -1,40 +1,78 @@
 use iced::border;
 use iced::theme::Palette;
-use iced::widget::{button, container};
+use iced::widget::{button, container, scrollable, text_input};
 use iced::{color, Background, Border, Color, Theme};
 
-/// Apple-like dark theme.
+pub const INTER: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
+pub const INTER_NAME: &str = "Inter";
+pub const JETBRAINS_MONO: &[u8] =
+    include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
+pub const MONO_NAME: &str = "JetBrains Mono";
+
+pub fn mono_font() -> iced::Font {
+    iced::Font {
+        family: iced::font::Family::Name(MONO_NAME),
+        ..iced::Font::DEFAULT
+    }
+}
+
 pub fn theme() -> Theme {
     Theme::custom(
         "WunderDark",
         Palette {
-            background: color!(0x1e1e1e),
-            text: color!(0xffffff),
-            primary: color!(0x0a84ff),
-            success: color!(0x30d158),
-            warning: color!(0xff9f0a),
-            danger: color!(0xff453a),
+            background: APP,
+            text: INK,
+            primary: ACCENT,
+            success: SUCCESS,
+            warning: WARNING,
+            danger: ERROR,
         },
     )
 }
 
-pub const BG_SIDEBAR: Color = color!(0x252526);
-pub const BG_HOVER: Color = color!(0xffffff, 0.06);
-pub const TEXT_SECONDARY: Color = color!(0x8e8e93);
-pub const ACCENT: Color = color!(0x0a84ff);
-pub const DANGER: Color = color!(0xff453a);
-pub const SEPARATOR: Color = color!(0xffffff, 0.08);
+// App surfaces (hue 235, blue-tinted darks)
+pub const APP: Color = color!(0x1C1D26);
+pub const APP_BOX: Color = color!(0x272835);
+pub const APP_DARK_BOX: Color = color!(0x21222B);
+pub const APP_INPUT: Color = color!(0x2C2D3B);
+pub const APP_HOVER: Color = color!(0x292A37);
+pub const APP_SELECTED: Color = color!(0x353646);
+pub const APP_LINE: Color = color!(0x323343);
+pub const APP_OVERLAY: Color = color!(0x252632);
+
+// Sidebar (darkest surface)
+pub const SIDEBAR: Color = color!(0x0F1015);
+pub const SIDEBAR_BOX: Color = color!(0x232430);
+pub const SIDEBAR_DIVIDER: Color = color!(0x252632);
+pub const SIDEBAR_BUTTON: Color = color!(0x272835);
+
+// Accent
+pub const ACCENT: Color = color!(0x2599FF);
+pub const ACCENT_FAINT: Color = color!(0x5DB4FF);
+
+// Text hierarchy
+pub const INK: Color = color!(0xE4E5F2);
+pub const INK_DULL: Color = color!(0xABACBA);
+pub const INK_FAINT: Color = color!(0x818398);
+
+// Status
+pub const SUCCESS: Color = color!(0x16A34A);
+pub const WARNING: Color = color!(0xFBA517);
+pub const ERROR: Color = color!(0xE5484D);
+
+// Scrollbar
+pub const SCROLLBAR_THUMB: Color = color!(0x393948);
 
 // ---- Button styles ----
 
 pub fn row_button(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
-        button::Status::Active | button::Status::Disabled => Color::TRANSPARENT,
-        button::Status::Hovered | button::Status::Pressed => BG_HOVER,
+        button::Status::Hovered | button::Status::Pressed => APP_HOVER,
+        _ => Color::TRANSPARENT,
     };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: color!(0xffffff),
+        text_color: INK,
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
@@ -45,18 +83,46 @@ pub fn row_button(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-pub fn selected_row_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let bg = match status {
-        button::Status::Active | button::Status::Disabled => color!(0x0a84ff, 0.22),
-        button::Status::Hovered | button::Status::Pressed => color!(0x0a84ff, 0.32),
-    };
+pub fn selected_row_button(_theme: &Theme, _status: button::Status) -> button::Style {
     button::Style {
-        background: Some(Background::Color(bg)),
-        text_color: color!(0xffffff),
+        background: Some(Background::Color(APP_SELECTED)),
+        text_color: INK,
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
             radius: border::radius(6.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
+pub fn grid_cell_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered | button::Status::Pressed => APP_HOVER,
+        _ => APP_BOX,
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: INK,
+        border: Border {
+            color: APP_LINE,
+            width: 1.0,
+            radius: border::radius(8.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
+pub fn grid_cell_button_selected(_theme: &Theme, _status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(Background::Color(APP_SELECTED)),
+        text_color: INK,
+        border: Border {
+            color: ACCENT,
+            width: 1.0,
+            radius: border::radius(8.0),
         },
         shadow: Default::default(),
         snap: true,
@@ -65,12 +131,12 @@ pub fn selected_row_button(_theme: &Theme, status: button::Status) -> button::St
 
 pub fn primary_button(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
-        button::Status::Disabled => color!(0x0a84ff, 0.4),
+        button::Status::Disabled => Color { a: 0.4, ..ACCENT },
         _ => ACCENT,
     };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: color!(0xffffff),
+        text_color: color!(0xFFFFFF),
         border: Border {
             color: Color::TRANSPARENT,
             width: 0.0,
@@ -81,35 +147,59 @@ pub fn primary_button(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-pub fn back_button(_theme: &Theme, status: button::Status) -> button::Style {
+pub fn gray_button(_theme: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
-        button::Status::Active | button::Status::Disabled => Color::TRANSPARENT,
-        button::Status::Hovered | button::Status::Pressed => BG_HOVER,
+        button::Status::Hovered | button::Status::Pressed => APP_HOVER,
+        _ => SIDEBAR_BUTTON,
+    };
+    let border_color = match status {
+        button::Status::Hovered | button::Status::Pressed => APP_LINE,
+        _ => Color { a: 0.5, ..APP_LINE },
     };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: ACCENT,
+        text_color: INK,
         border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: border::radius(6.0),
-        },
-        shadow: Default::default(),
-        snap: true,
-    }
-}
-
-pub fn ghost_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let bg = match status {
-        button::Status::Active | button::Status::Disabled => Color::TRANSPARENT,
-        button::Status::Hovered | button::Status::Pressed => BG_HOVER,
-    };
-    button::Style {
-        background: Some(Background::Color(bg)),
-        text_color: TEXT_SECONDARY,
-        border: Border {
-            color: SEPARATOR,
+            color: border_color,
             width: 1.0,
+            radius: border::radius(6.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
+pub fn subtle_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let (bg, border_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            (Color::TRANSPARENT, APP_LINE)
+        }
+        _ => (Color::TRANSPARENT, Color::TRANSPARENT),
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: INK_DULL,
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: border::radius(6.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
+pub fn icon_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered | button::Status::Pressed => APP_HOVER,
+        _ => Color::TRANSPARENT,
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: INK_DULL,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
             radius: border::radius(6.0),
         },
         shadow: Default::default(),
@@ -121,11 +211,39 @@ pub fn ghost_button(_theme: &Theme, status: button::Status) -> button::Style {
 
 pub fn sidebar_container(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(BG_SIDEBAR)),
-        text_color: Some(color!(0xffffff)),
+        background: Some(Background::Color(SIDEBAR)),
+        text_color: Some(INK),
         border: Border {
-            color: Color::TRANSPARENT,
+            color: APP_LINE,
             width: 0.0,
+            radius: border::radius(0.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
+pub fn top_bar_container(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(APP)),
+        text_color: Some(INK),
+        border: Border {
+            color: APP_LINE,
+            width: 0.0,
+            radius: border::radius(0.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
+pub fn status_bar_container(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(APP)),
+        text_color: Some(INK_DULL),
+        border: Border {
+            color: APP_LINE,
+            width: 1.0,
             radius: border::radius(0.0),
         },
         shadow: Default::default(),
@@ -135,12 +253,12 @@ pub fn sidebar_container(_theme: &Theme) -> container::Style {
 
 pub fn badge_container(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(color!(0xff453a, 0.25))),
-        text_color: Some(color!(0xff6258)),
+        background: Some(Background::Color(Color { a: 0.2, ..ERROR })),
+        text_color: Some(ERROR),
         border: Border {
-            color: color!(0xff453a, 0.5),
-            width: 1.0,
-            radius: border::radius(8.0),
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: border::radius(999.0),
         },
         shadow: Default::default(),
         snap: true,
@@ -149,14 +267,96 @@ pub fn badge_container(_theme: &Theme) -> container::Style {
 
 pub fn preview_container(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(BG_SIDEBAR)),
-        text_color: Some(color!(0xffffff)),
+        background: Some(Background::Color(APP_DARK_BOX)),
+        text_color: Some(INK),
         border: Border {
-            color: SEPARATOR,
+            color: APP_LINE,
             width: 1.0,
             radius: border::radius(0.0),
         },
         shadow: Default::default(),
         snap: true,
+    }
+}
+
+pub fn search_pill_container(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(APP_OVERLAY)),
+        text_color: Some(INK),
+        border: Border {
+            color: Color { a: 0.3, ..APP_LINE },
+            width: 1.0,
+            radius: border::radius(999.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
+// ---- Text input style ----
+
+pub fn borderless_input(_theme: &Theme, _status: text_input::Status) -> text_input::Style {
+    text_input::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: border::radius(0.0),
+        },
+        icon: INK_FAINT,
+        placeholder: INK_FAINT,
+        value: INK,
+        selection: Color { a: 0.3, ..ACCENT },
+    }
+}
+
+// ---- Scrollable style ----
+
+pub fn thin_scrollable(_theme: &Theme, _status: scrollable::Status) -> scrollable::Style {
+    scrollable::Style {
+        container: container::Style::default(),
+        vertical_rail: scrollable::Rail {
+            background: Some(Background::Color(Color::TRANSPARENT)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: border::radius(999.0),
+            },
+            scroller: scrollable::Scroller {
+                background: Background::Color(SCROLLBAR_THUMB),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: border::radius(999.0),
+                },
+            },
+        },
+        horizontal_rail: scrollable::Rail {
+            background: Some(Background::Color(Color::TRANSPARENT)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: border::radius(999.0),
+            },
+            scroller: scrollable::Scroller {
+                background: Background::Color(SCROLLBAR_THUMB),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: border::radius(999.0),
+                },
+            },
+        },
+        gap: None,
+        auto_scroll: scrollable::AutoScroll {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: border::radius(0.0),
+            },
+            shadow: Default::default(),
+            icon: INK_FAINT,
+        },
     }
 }

@@ -37,7 +37,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # IPC
 interprocess = { version = "2.4", features = ["tokio"] }
 # GUI
-iced = { version = "0.14", features = ["tokio"] }
+iced = { version = "0.14", features = ["tokio", "svg"] }
 # Extraction + search (spec §6)
 tantivy = "0.24"
 lopdf = "0.34"
