@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::journal::JournalEntry;
+use crate::journal::{JournalEntry, StubEntry};
 
 /// A local file's observed state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,8 +48,13 @@ pub enum Action {
     Compare,
     /// New local-only → upload.
     UploadNew,
-    /// New remote-only → download.
+    /// New remote-only → download (non-lazy) or record stub (lazy).
     DownloadNew,
+    /// Lazy mode: new remote-only → record stub, no I/O.
+    RecordStub,
+    /// Lazy mode: materialized file deleted locally → move back to stub,
+    /// keep the remote object. Never auto-delete remote in lazy mode.
+    Dematerialize,
     /// Present in journal but gone on both sides → drop the journal row.
     DropJournal,
 }
@@ -71,9 +76,15 @@ pub struct Inputs<'a> {
     pub journal: &'a HashMap<String, JournalEntry>,
     pub local: &'a HashMap<String, Local>,
     pub remote: &'a HashMap<String, Remote>,
+    /// Lazy-download stubs (remote-only metadata, no local bytes).
+    pub stub: &'a HashMap<String, StubEntry>,
+    /// Whether lazy download is enabled. When true, remote-only objects become
+    /// stubs instead of being downloaded; local deletes dematerialize instead
+    /// of propagating to the remote.
+    pub lazy: bool,
 }
 
-/// Decide the action list for every key in the union of the three inputs.
+/// Decide the action list for every key in the union of the four inputs.
 ///
 /// Deterministic: iterates keys in sorted order and returns actions in that
 /// order (handy for stable tests and logs).
@@ -88,6 +99,9 @@ pub fn plan(inputs: Inputs<'_>) -> Vec<(String, Action)> {
     for k in inputs.remote.keys() {
         keys.insert(k.clone());
     }
+    for k in inputs.stub.keys() {
+        keys.insert(k.clone());
+    }
 
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
@@ -95,6 +109,8 @@ pub fn plan(inputs: Inputs<'_>) -> Vec<(String, Action)> {
             inputs.journal.get(&key),
             inputs.local.get(&key),
             inputs.remote.get(&key),
+            inputs.stub.get(&key),
+            inputs.lazy,
         );
         out.push((key, action));
     }
@@ -102,9 +118,18 @@ pub fn plan(inputs: Inputs<'_>) -> Vec<(String, Action)> {
 }
 
 /// Decide the action for a single key. Exposed for unit testing.
-pub fn decide(j: Option<&JournalEntry>, l: Option<&Local>, r: Option<&Remote>) -> Action {
+///
+/// `stub` is the prior stub entry for this key (if any); `lazy` selects the
+/// lazy-download policy.
+pub fn decide(
+    j: Option<&JournalEntry>,
+    l: Option<&Local>,
+    r: Option<&Remote>,
+    stub: Option<&StubEntry>,
+    lazy: bool,
+) -> Action {
     match (j, l, r) {
-        // Baseline exists — reconcile against it.
+        // Baseline exists (materialized file) — reconcile against it.
         (Some(j), Some(l), Some(r)) => {
             let l_dirty = l.size != j.size || l.mtime_millis != j.mtime_millis;
             let r_dirty = r.version != j.remote_version || r.size != j.size;
@@ -115,17 +140,35 @@ pub fn decide(j: Option<&JournalEntry>, l: Option<&Local>, r: Option<&Remote>) -
                 (true, true) => Action::Conflict,
             }
         }
-        // Baseline + remote, local gone → real delete; propagate to remote.
-        (Some(_), None, Some(_)) => Action::DeleteRemote,
-        // Baseline + local, remote gone → propagate delete locally.
+        // Materialized file deleted locally, still remote.
+        (Some(_), None, Some(_)) => {
+            if lazy {
+                Action::Dematerialize
+            } else {
+                Action::DeleteRemote
+            }
+        }
+        // Materialized file deleted locally, remote also gone → full delete.
         (Some(_), Some(_), None) => Action::DeleteLocal,
         // Baseline only, both gone → clean up the journal.
         (Some(_), None, None) => Action::DropJournal,
 
-        // No baseline (first time we see this key).
+        // No baseline (first time we see this key on at least one side).
         (None, Some(_), Some(_)) => Action::Compare,
         (None, Some(_), None) => Action::UploadNew,
-        (None, None, Some(_)) => Action::DownloadNew,
+        (None, None, Some(_)) => {
+            if lazy {
+                // Remote-only, no local file, no baseline. If we already have a
+                // stub for this key, skip; otherwise record one.
+                if stub.is_some() {
+                    Action::Skip
+                } else {
+                    Action::RecordStub
+                }
+            } else {
+                Action::DownloadNew
+            }
+        }
 
         // (None, None, None) impossible — key came from one of the maps.
         (None, None, None) => Action::Skip,
@@ -175,7 +218,18 @@ mod tests {
     }
 
     fn act(j: Option<JournalEntry>, l: Option<Local>, r: Option<Remote>) -> Action {
-        decide(j.as_ref(), l.as_ref(), r.as_ref())
+        decide(j.as_ref(), l.as_ref(), r.as_ref(), None, false)
+    }
+
+    fn act_lazy(j: Option<JournalEntry>, l: Option<Local>, r: Option<Remote>) -> Action {
+        decide(j.as_ref(), l.as_ref(), r.as_ref(), None, true)
+    }
+
+    fn stub(size: u64, ver: Option<&str>) -> StubEntry {
+        StubEntry {
+            size,
+            version: ver.map(str::to_string),
+        }
     }
 
     #[test]
@@ -293,16 +347,19 @@ mod tests {
         let journal = map([("a".to_string(), j(1, 1, 1, Some("v")))]);
         let local = map([("c".to_string(), l(1, 1))]);
         let remote = map([("b".to_string(), r(1, Some("v")))]);
+        let stubs = HashMap::new();
         let actions = plan(Inputs {
             journal: &journal,
             local: &local,
             remote: &remote,
+            stub: &stubs,
+            lazy: false,
         });
         let keys: Vec<_> = actions.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["a", "b", "c"]);
         // a: j only (no l, no r) → DropJournal
         assert_eq!(actions[0].1, Action::DropJournal);
-        // b: r only → DownloadNew
+        // b: r only → DownloadNew (non-lazy)
         assert_eq!(actions[1].1, Action::DownloadNew);
         // c: l only → UploadNew
         assert_eq!(actions[2].1, Action::UploadNew);
@@ -318,6 +375,51 @@ mod tests {
                 Some(r(10, None))
             ),
             Action::Skip
+        );
+    }
+
+    // --- lazy mode ---
+
+    #[test]
+    fn lazy_remote_only_records_stub() {
+        // Remote-only, no local, no baseline, lazy → RecordStub (not DownloadNew).
+        assert_eq!(
+            act_lazy(None, None, Some(r(10, Some("v")))),
+            Action::RecordStub
+        );
+    }
+
+    #[test]
+    fn non_lazy_remote_only_downloads() {
+        // Same input, non-lazy → DownloadNew (unchanged behaviour).
+        assert_eq!(act(None, None, Some(r(10, Some("v")))), Action::DownloadNew);
+    }
+
+    #[test]
+    fn lazy_remote_only_with_existing_stub_skips() {
+        // Already stubbed → Skip (don't re-record).
+        let s = stub(10, Some("v"));
+        assert_eq!(
+            decide(None, None, Some(&r(10, Some("v"))), Some(&s), true),
+            Action::Skip
+        );
+    }
+
+    #[test]
+    fn lazy_local_delete_dematerializes() {
+        // Materialized file deleted locally, remote intact, lazy → Dematerialize.
+        assert_eq!(
+            act_lazy(Some(j(1, 10, 100, Some("v"))), None, Some(r(10, Some("v")))),
+            Action::Dematerialize
+        );
+    }
+
+    #[test]
+    fn non_lazy_local_delete_propagates_to_remote() {
+        // Same input, non-lazy → DeleteRemote (the original behaviour).
+        assert_eq!(
+            act(Some(j(1, 10, 100, Some("v"))), None, Some(r(10, Some("v")))),
+            Action::DeleteRemote
         );
     }
 }

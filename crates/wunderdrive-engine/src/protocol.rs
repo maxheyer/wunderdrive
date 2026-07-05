@@ -70,6 +70,7 @@ pub const METHOD_RESUME: &str = "resume";
 pub const METHOD_RESOLVE_CONFLICT: &str = "resolve_conflict";
 pub const METHOD_SEARCH: &str = "search";
 pub const METHOD_INDEX_NOW: &str = "index_now";
+pub const METHOD_MATERIALIZE: &str = "materialize";
 
 // Framing ------------------------------------------------------------------
 

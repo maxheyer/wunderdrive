@@ -80,6 +80,7 @@ impl Mirror {
     pub async fn sync_once(&self, tx: &mpsc::Sender<SyncEvent>) -> Result<SyncOutcome> {
         let _ = tx.try_send(SyncEvent::Started);
         let journal_map = journal::snapshot(&self.db)?;
+        let stub_map = journal::stub_list(&self.db)?;
 
         let local = self.gather_local()?;
         let remote = self.gather_remote().await?;
@@ -88,11 +89,16 @@ impl Mirror {
             journal: &journal_map,
             local: &local,
             remote: &remote,
+            stub: &stub_map,
+            lazy: self.cfg.lazy,
         });
 
         let mut out = SyncOutcome::default();
         for (key, action) in actions {
-            if let Err(e) = self.apply(&key, &action, &journal_map, &local, tx).await {
+            if let Err(e) = self
+                .apply(&key, &action, &journal_map, &local, &remote, tx)
+                .await
+            {
                 warn!(key = %key, error = %e, "sync action failed");
                 out.errors += 1;
                 let _ = tx.try_send(SyncEvent::Error(key.clone(), e.to_string()));
@@ -173,6 +179,7 @@ impl Mirror {
         action: &Action,
         journal_map: &HashMap<String, JournalEntry>,
         _local: &HashMap<String, Local>,
+        remote: &HashMap<String, Remote>,
         tx: &mpsc::Sender<SyncEvent>,
     ) -> Result<()> {
         match action {
@@ -281,6 +288,36 @@ impl Mirror {
                         Ok(())
                     }
                 }
+            }
+
+            Action::RecordStub => {
+                // Lazy mode: remote-only object → record metadata, no download.
+                let r = remote.get(key).ok_or_else(|| {
+                    Error::other("RecordStub: remote entry vanished before apply")
+                })?;
+                let stub = journal::StubEntry {
+                    size: r.size,
+                    version: r.version.clone(),
+                };
+                journal::stub_put(&self.db, key, &stub)?;
+                debug!(key = %key, "recorded stub (lazy)");
+                Ok(())
+            }
+
+            Action::Dematerialize => {
+                // Lazy mode: materialized file deleted locally → move to stub,
+                // keep the remote object. Never auto-delete remote in lazy mode.
+                let j = journal_map.get(key).ok_or_else(|| {
+                    Error::other("Dematerialize: journal entry vanished before apply")
+                })?;
+                let stub = journal::StubEntry {
+                    size: j.size,
+                    version: j.remote_version.clone(),
+                };
+                journal::stub_put(&self.db, key, &stub)?;
+                journal::remove(&self.db, key)?;
+                debug!(key = %key, "dematerialized (lazy local delete)");
+                Ok(())
             }
         }
     }
@@ -503,6 +540,32 @@ impl Mirror {
             }
         }
     }
+
+    /// Materialize a lazy-download stub: fetch the bytes, write the local file,
+    /// promote the stub to the main journal. The next index sweep will pick it
+    /// up for search. No-op (returns Ok) if the key isn't a stub.
+    pub async fn materialize(&self, key: &str) -> Result<()> {
+        let stub = match journal::stub_list(&self.db)?.remove(key) {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        // Fetch + hash + write — same path as do_download but we already have
+        // the stub metadata to fall back on if the remote version changed.
+        let (bytes, _rhash, version) = self.fetch_with_hash(key).await?;
+        let local_path = local_for_key(&self.cfg.local_root, key);
+        self.write_file(&local_path, &bytes).await?;
+        let hash = crate::hash::hash_bytes(&bytes);
+        let entry = JournalEntry {
+            blake3: hash,
+            size: bytes.len() as u64,
+            mtime_millis: mtime_millis(&local_path)?,
+            remote_version: version.or(stub.version),
+        };
+        journal::upsert(&self.db, key, &entry)?;
+        journal::stub_remove(&self.db, key)?;
+        info!(key = %key, "materialized stub");
+        Ok(())
+    }
 }
 
 /// Find the sibling conflict-copy key for `key` in the journal (the saved
@@ -604,7 +667,8 @@ fn tally_action(action: &Action, out: &mut SyncOutcome) {
         Action::Conflict => out.conflicts += 1,
         Action::DeleteRemote => out.deleted_remote += 1,
         Action::DeleteLocal => out.deleted_local += 1,
-        Action::DropJournal => {}
-        Action::Compare => {}
+        // Lazy-mode bookkeeping; not counted as sync transfer activity.
+        Action::RecordStub | Action::Dematerialize => {}
+        Action::DropJournal | Action::Compare => {}
     }
 }

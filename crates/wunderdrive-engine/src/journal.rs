@@ -23,6 +23,24 @@ const TABLE: TableDefinition<&str, &str> = TableDefinition::new("entries");
 /// rename / move / second-device is a free cache hit (spec §6).
 const EXTRACT_TABLE: TableDefinition<&str, &str> = TableDefinition::new("extracted");
 
+/// Lazy-download stubs: relative-key → JSON [`StubEntry`]. Records a remote
+/// object's existence without downloading bytes. Promoted to `TABLE` on
+/// materialize. See spec §10 (selective sync, pulled forward).
+const STUB_TABLE: TableDefinition<&str, &str> = TableDefinition::new("stubs");
+
+/// Tantivy index manifest: relative-key → blake3-hex of the indexed text.
+/// Tracks what the search index currently holds so the sweep can diff cheaply:
+/// orphans (key here but not in the journal) get deleted; renames (new key,
+/// same hash) re-insert from the extraction cache without re-parsing.
+const INDEXED_TABLE: TableDefinition<&str, &str> = TableDefinition::new("indexed");
+
+/// Metadata for a remote-only object (lazy-download stub).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StubEntry {
+    pub size: u64,
+    pub version: Option<String>,
+}
+
 /// One row of the last-synced snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JournalEntry {
@@ -48,11 +66,13 @@ pub fn open(path: &Path) -> Result<Database> {
         std::fs::create_dir_all(parent)?;
     }
     let db = Database::create(path)?;
-    // Ensure both tables exist.
+    // Ensure all tables exist.
     let txn = db.begin_write()?;
     {
         let _ = txn.open_table(TABLE)?;
         let _ = txn.open_table(EXTRACT_TABLE)?;
+        let _ = txn.open_table(STUB_TABLE)?;
+        let _ = txn.open_table(INDEXED_TABLE)?;
     }
     txn.commit()?;
     Ok(db)
@@ -181,6 +201,113 @@ pub fn extract_has(db: &Database, hash: &[u8; 32]) -> Result<bool> {
     Ok(table.get(key.as_str())?.is_some())
 }
 
+// Lazy-download stubs ------------------------------------------------------
+
+/// Read all stubs into a map keyed by relative key.
+pub fn stub_list(db: &Database) -> Result<HashMap<String, StubEntry>> {
+    let read = db.begin_read()?;
+    let table = read.open_table(STUB_TABLE)?;
+    let mut out = HashMap::new();
+    for row in table.iter()? {
+        let (k, v) = row?;
+        let key = k.value().to_string();
+        let entry: StubEntry = serde_json::from_str(v.value())
+            .map_err(|e| crate::Error::other(format!("stub decode {key}: {e}")))?;
+        out.insert(key, entry);
+    }
+    Ok(out)
+}
+
+/// Record or replace a stub.
+pub fn stub_put(db: &Database, key: &str, entry: &StubEntry) -> Result<()> {
+    let json = serde_json::to_string(entry)
+        .map_err(|e| crate::Error::other(format!("stub encode: {e}")))?;
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(STUB_TABLE)?;
+        table.insert(key, json.as_str())?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// Remove a stub (called after materialize promotes it to the main journal).
+pub fn stub_remove(db: &Database, key: &str) -> Result<()> {
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(STUB_TABLE)?;
+        table.remove(key)?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+// Tantivy index manifest ---------------------------------------------------
+
+/// Read all indexed keys → blake3-hex. Used by the sweep to diff against the
+/// journal and find orphans (deletes) and renames (new key, same hash).
+pub fn indexed_list(db: &Database) -> Result<HashMap<String, [u8; 32]>> {
+    let read = db.begin_read()?;
+    let table = read.open_table(INDEXED_TABLE)?;
+    let mut out = HashMap::new();
+    for row in table.iter()? {
+        let (k, v) = row?;
+        let key = k.value().to_string();
+        let hash = crate::hash::from_hex(v.value())
+            .ok_or_else(|| crate::Error::other(format!("indexed decode {key}: bad hash")))?;
+        out.insert(key, hash);
+    }
+    Ok(out)
+}
+
+/// Record that `key` is in the Tantivy index with content `hash`.
+pub fn indexed_put(db: &Database, key: &str, hash: &[u8; 32]) -> Result<()> {
+    let hex = crate::hash::to_hex(hash);
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(INDEXED_TABLE)?;
+        table.insert(key, hex.as_str())?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// Remove an indexed-key record (after the Tantivy doc was deleted).
+pub fn indexed_remove(db: &Database, key: &str) -> Result<()> {
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(INDEXED_TABLE)?;
+        table.remove(key)?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+/// Clear the entire extraction cache. Used by [`Indexer::rebuild`] to force
+/// re-extraction on the next sweep.
+pub fn extract_clear(db: &Database) -> Result<()> {
+    // ponytail: redb 4.x has no Table::clear; read keys then drop each. Cheap
+    // enough for the rare rebuild path. Swap for drain_filter if redb grows it.
+    let keys: Vec<String> = {
+        let read = db.begin_read()?;
+        let table = read.open_table(EXTRACT_TABLE)?;
+        table
+            .iter()?
+            .filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_string())
+            .collect()
+    };
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(EXTRACT_TABLE)?;
+        for k in &keys {
+            table.remove(k.as_str())?;
+        }
+    }
+    txn.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +349,33 @@ mod tests {
         extract_put(&db, &h, "hello").unwrap();
         assert!(extract_has(&db, &h).unwrap());
         assert_eq!(extract_get(&db, &h).unwrap().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn stub_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir.path().join("j.redb")).unwrap();
+        assert!(stub_list(&db).unwrap().is_empty());
+        let e = StubEntry {
+            size: 99,
+            version: Some("v3".into()),
+        };
+        stub_put(&db, "remote/file.pdf", &e).unwrap();
+        let map = stub_list(&db).unwrap();
+        assert_eq!(map.get("remote/file.pdf"), Some(&e));
+        stub_remove(&db, "remote/file.pdf").unwrap();
+        assert!(stub_list(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn indexed_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir.path().join("j.redb")).unwrap();
+        let h = [42u8; 32];
+        indexed_put(&db, "a.txt", &h).unwrap();
+        let map = indexed_list(&db).unwrap();
+        assert_eq!(map.get("a.txt"), Some(&h));
+        indexed_remove(&db, "a.txt").unwrap();
+        assert!(indexed_list(&db).unwrap().is_empty());
     }
 }

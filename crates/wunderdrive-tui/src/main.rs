@@ -30,8 +30,8 @@ use tokio::io::BufStream;
 use tokio::time::interval;
 use wunderdrive_engine::protocol::{
     read_msg, write_msg, Request, Resolution, Response, METHOD_ACTIVITY, METHOD_INDEX_NOW,
-    METHOD_PAUSE, METHOD_RESOLVE_CONFLICT, METHOD_RESUME, METHOD_SEARCH, METHOD_SNAPSHOT,
-    METHOD_STATUS, METHOD_SYNC_NOW,
+    METHOD_MATERIALIZE, METHOD_PAUSE, METHOD_RESOLVE_CONFLICT, METHOD_RESUME, METHOD_SEARCH,
+    METHOD_SNAPSHOT, METHOD_STATUS, METHOD_SYNC_NOW,
 };
 use wunderdrive_engine::{ActivityEntry, FileStatus, SearchHit, Snapshot, Status};
 
@@ -211,6 +211,12 @@ impl Client {
         let _ = self.call(METHOD_INDEX_NOW, serde_json::Value::Null).await?;
         Ok(())
     }
+    async fn materialize(&mut self, key: &str) -> Result<()> {
+        let _ = self
+            .call(METHOD_MATERIALIZE, serde_json::json!({ "key": key }))
+            .await?;
+        Ok(())
+    }
 }
 
 fn parse<T: serde::de::DeserializeOwned>(r: Response) -> Result<T> {
@@ -331,6 +337,19 @@ async fn handle_event(app: &mut App, client: &mut Client, ev: Event) -> Result<b
                 Ok(_) => app.last_error = None,
                 Err(e) => app.last_error = Some(e.to_string()),
             },
+            KeyCode::Char('d') | KeyCode::Enter => {
+                // Materialize a lazy-download stub from the Files tab.
+                if app.tab == 0 {
+                    if let Some(f) = app.snapshot.files.get(app.list.selected().unwrap_or(0)) {
+                        if f.status == FileStatus::RemoteOnly {
+                            match client.materialize(&f.key).await {
+                                Ok(_) => app.last_error = None,
+                                Err(e) => app.last_error = Some(e.to_string()),
+                            }
+                        }
+                    }
+                }
+            }
             KeyCode::Char('l') => {
                 if app.tab == 1 {
                     if let Some(key) = app.conflicts.get(app.list.selected().unwrap_or(0)).cloned()
@@ -410,6 +429,9 @@ mod ui {
         if app.tab == 1 {
             help.push_str("  [l] keep-local  [o] keep-remote  [b] keep-both");
         }
+        if app.tab == 0 {
+            help.push_str("  [d] materialize stub");
+        }
         if app.tab == 3 {
             help.push_str("  [enter] run  [esc] clear");
         }
@@ -436,6 +458,9 @@ mod ui {
                         Span::styled("✗ ", Style::default().fg(Color::Red))
                     }
                     FileStatus::Conflict => Span::styled("! ", Style::default().fg(Color::Magenta)),
+                    FileStatus::RemoteOnly => {
+                        Span::styled("☁ ", Style::default().fg(Color::DarkGray))
+                    }
                 };
                 ListItem::new(Line::from(vec![
                     mark,

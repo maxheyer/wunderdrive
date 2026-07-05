@@ -45,6 +45,9 @@ pub enum FileStatus {
     DeletedPending,
     /// Known conflict (both sides changed).
     Conflict,
+    /// Lazy-download stub: exists remotely, not yet materialized locally.
+    /// Search won't find it; call `materialize` to fetch bytes.
+    RemoteOnly,
 }
 
 /// One file in a [`Snapshot`].
@@ -221,9 +224,10 @@ impl Engine {
 
     pub fn snapshot(&self) -> Result<Snapshot> {
         let journal_map = journal::snapshot(&self.db)?;
+        let stub_map = journal::stub_list(&self.db)?;
         let local = gather_local_stat(&self.cfg.local_root)?;
         let conflicts = self.state.conflicts.lock().unwrap().clone();
-        let mut files = Vec::with_capacity(journal_map.len() + local.len());
+        let mut files = Vec::with_capacity(journal_map.len() + local.len() + stub_map.len());
 
         let mut keys: HashSet<&String> = HashSet::new();
         for k in journal_map.keys() {
@@ -232,26 +236,40 @@ impl Engine {
         for k in local.keys() {
             keys.insert(k);
         }
+        for k in stub_map.keys() {
+            keys.insert(k);
+        }
         let mut keys: Vec<&String> = keys.into_iter().collect();
         keys.sort();
 
         for key in keys {
             let j = journal_map.get(key);
             let l = local.get(key);
+            let s = stub_map.get(key);
             let status = if conflicts.contains(key) {
                 FileStatus::Conflict
             } else {
-                match (j, l) {
-                    (Some(j), Some(l)) => {
+                match (j, l, s) {
+                    (Some(j), Some(l), _) => {
                         if j.size == l.size && j.mtime_millis == l.mtime_millis {
                             FileStatus::Synced
                         } else {
                             FileStatus::PendingUpload
                         }
                     }
-                    (None, Some(_)) => FileStatus::NewLocal,
-                    (Some(_), None) => FileStatus::DeletedPending,
-                    (None, None) => continue,
+                    (None, Some(_), _) => FileStatus::NewLocal,
+                    (Some(_), None, _) => FileStatus::DeletedPending,
+                    // No journal, no local, but a stub → remote-only (lazy).
+                    (None, None, Some(stub)) => {
+                        files.push(FileStat {
+                            key: key.clone(),
+                            size: stub.size,
+                            mtime_millis: 0,
+                            status: FileStatus::RemoteOnly,
+                        });
+                        continue;
+                    }
+                    (None, None, None) => continue,
                 }
             };
             let (size, mtime) = match l {
@@ -354,6 +372,17 @@ impl Engine {
             return Ok(0);
         };
         ix.sweep().await.map_err(|_| "index sweep failed")
+    }
+
+    /// Materialize a lazy-download stub: fetch the bytes, write the local file,
+    /// promote the stub to the main journal, then trigger an index sweep so the
+    /// file becomes searchable. No-op if the key isn't a stub.
+    pub async fn materialize(&self, key: &str) -> Result<()> {
+        self.mirror.materialize(key).await?;
+        // The newly-materialized file needs indexing. Fire-and-forget; the
+        // index loop coalesces if a sweep is already running.
+        let _ = self.sync_now().await;
+        Ok(())
     }
 }
 

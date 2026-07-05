@@ -32,6 +32,11 @@ pub struct Config {
     /// Full local rescan interval in seconds. Default 300.
     #[serde(default = "default_local_rescan")]
     pub local_rescan_secs: u64,
+    /// Lazy download (spec §10 phase 4, pulled forward): remote objects appear
+    /// as browseable stubs; bytes fetch only on explicit materialize. Default
+    /// true for new installs. Set `false` for the original full-mirror behavior.
+    #[serde(default = "default_lazy")]
+    pub lazy: bool,
 }
 
 fn default_remote_poll() -> u64 {
@@ -39,6 +44,9 @@ fn default_remote_poll() -> u64 {
 }
 fn default_local_rescan() -> u64 {
     300
+}
+fn default_lazy() -> bool {
+    true
 }
 
 impl Config {
@@ -135,6 +143,7 @@ mod tests {
             local_root: PathBuf::from("~/drive"),
             remote_poll_secs: 30,
             local_rescan_secs: 60,
+            lazy: false,
         };
         cfg.save(tmp.path()).unwrap();
         let loaded = Config::load(tmp.path()).unwrap();
@@ -156,5 +165,6 @@ local_root = "/tmp/drive"
         let cfg = Config::load(tmp.path()).unwrap();
         assert_eq!(cfg.remote_poll_secs, 45);
         assert_eq!(cfg.local_rescan_secs, 300);
+        assert!(cfg.lazy); // default true for new installs
     }
 }

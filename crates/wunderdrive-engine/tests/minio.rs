@@ -52,6 +52,7 @@ fn setup() -> Env {
         local_root: tmp.path().join("root"),
         remote_poll_secs: 3600,
         local_rescan_secs: 3600,
+        lazy: false,
     };
     Env { cfg, creds, tmp }
 }

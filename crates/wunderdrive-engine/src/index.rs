@@ -87,40 +87,72 @@ impl Indexer {
         })
     }
 
-    /// Walk the journal; for each entry whose hash is not in the extraction
-    /// cache, read the local file, extract text, store it, and add to the index.
-    /// Returns the number of newly-indexed keys.
+    /// Walk the journal and reconcile the Tantivy index against it.
     ///
-    /// Cache hits are skipped — the extraction cache and the index are tied:
-    /// if you ever wipe the index dir, clear the extraction table too (or call
-    /// [`Self::rebuild`]).
+    /// Three cases per key:
+    /// - **Orphan** (in index, not in journal): delete the Tantivy doc. Catches
+    ///   deletes and renames — a renamed file appears as a new key (re-indexed
+    ///   below) + an orphaned old key (deleted here).
+    /// - **New / hash changed** (in journal, not in index or hash differs):
+    ///   extract (cache hit on rename), add a fresh Tantivy doc.
+    /// - **Unchanged** (in both, same hash): skip.
+    ///
+    /// Returns the net number of docs added minus deleted.
     pub async fn sweep(&self) -> Result<usize> {
         let entries = journal::snapshot(&self.db)?;
-        let mut count = 0;
-        // Hold the writer for the whole sweep: one transaction, one commit.
+        let indexed = journal::indexed_list(&self.db)?;
+        let mut count: isize = 0;
+
         let mut writer = self.writer.lock().await;
+
+        // Phase 1 — delete orphans (keys in the index but not in the journal).
+        for key in indexed.keys() {
+            if !entries.contains_key(key) {
+                writer.delete_term(tantivy::Term::from_field_text(self.key_field, key));
+                journal::indexed_remove(&self.db, key)?;
+                count -= 1;
+            }
+        }
+
+        // Phase 2 — add new / changed entries.
         for (key, entry) in &entries {
-            if journal::extract_has(&self.db, &entry.blake3)? {
+            // Skip if already indexed with the same content hash.
+            if indexed.get(key) == Some(&entry.blake3) {
                 continue;
             }
-            let path = local_for_key(&self.local_root, key);
-            let text = match extract_text(&path)? {
-                Some(t) => t,
-                None => String::new(), // sentinel: "no text" so we don't retry
+            // Cache hit? Reuse extracted text (free on rename / move). Otherwise
+            // read the local file and extract.
+            let text = if let Some(t) = journal::extract_get(&self.db, &entry.blake3)? {
+                t
+            } else {
+                let path = local_for_key(&self.local_root, key);
+                let t = extract_text(&path)?.unwrap_or_default();
+                // ponytail: empty string is the "no extractable text" sentinel
+                // so we don't re-parse binary files every sweep.
+                journal::extract_put(&self.db, &entry.blake3, &t)?;
+                t
             };
-            journal::extract_put(&self.db, &entry.blake3, &text)?;
+            // If a doc under this key already exists (hash changed), drop it
+            // before adding the fresh one.
+            writer.delete_term(tantivy::Term::from_field_text(self.key_field, key));
             if !text.is_empty() {
                 writer.add_document(doc!(
                     self.key_field => key.clone(),
                     self.text_field => text,
                 ))?;
+                journal::indexed_put(&self.db, key, &entry.blake3)?;
                 count += 1;
+            } else {
+                // No text to index; record the key as "seen" so we don't retry,
+                // but leave no Tantivy doc behind.
+                journal::indexed_remove(&self.db, key)?;
             }
         }
+
         writer.commit()?;
         self.reader.reload()?;
-        debug!(indexed = count, "index sweep done");
-        Ok(count)
+        debug!(net = count, "index sweep done");
+        Ok(count.max(0) as usize)
     }
 
     /// Drop a document by key. Called when a file leaves the journal.
@@ -129,7 +161,28 @@ impl Indexer {
         writer.delete_term(tantivy::Term::from_field_text(self.key_field, key));
         writer.commit()?;
         self.reader.reload()?;
+        journal::indexed_remove(&self.db, key)?;
         Ok(())
+    }
+
+    /// Wipe the Tantivy index + extraction cache + indexed manifest, then
+    /// re-sweep from scratch. Recovery path for corruption or after a schema
+    /// bump. Expensive — the next sweep re-extracts every file.
+    pub async fn rebuild(&self) -> Result<usize> {
+        let indexed = journal::indexed_list(&self.db)?;
+        {
+            let mut writer = self.writer.lock().await;
+            for key in indexed.keys() {
+                writer.delete_term(tantivy::Term::from_field_text(self.key_field, key));
+            }
+            writer.commit()?;
+        }
+        for key in indexed.keys() {
+            journal::indexed_remove(&self.db, key)?;
+        }
+        journal::extract_clear(&self.db)?;
+        self.reader.reload()?;
+        self.sweep().await
     }
 
     /// Run a query, returning up to `limit` ranked hits with snippets.
@@ -304,5 +357,79 @@ mod tests {
         indexer.sweep().await.unwrap();
         indexer.delete("gone.txt").await.unwrap();
         assert!(indexer.search("ephemeral", 5).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_cleans_up_after_journal_delete() {
+        // File gone from the journal (sync propagated the delete) but the
+        // Tantivy doc lingers — sweep must reap it.
+        let (db_dir, db) = tmp_db();
+        let root = tempfile::tempdir().unwrap();
+        let f = root.path().join("stale.txt");
+        std::fs::write(&f, b"stale content lingers").unwrap();
+        let h = crate::hash::hash_file(&f).unwrap();
+        journal::upsert(
+            &db,
+            "stale.txt",
+            &JournalEntry {
+                blake3: h,
+                size: 22,
+                mtime_millis: 1,
+                remote_version: None,
+            },
+        )
+        .unwrap();
+        let idx_dir = db_dir.path().join("idx");
+        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir).unwrap();
+        indexer.sweep().await.unwrap();
+        assert_eq!(indexer.search("lingers", 5).unwrap().len(), 1);
+        // Sync deletes the file: journal loses the entry, INDEXED_TABLE keeps it.
+        journal::remove(&db, "stale.txt").unwrap();
+        // Sweep should reap the orphan.
+        indexer.sweep().await.unwrap();
+        assert!(indexer.search("lingers", 5).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_handles_rename_via_cache() {
+        // Rename: same content → same hash → cache hit. Old key should be
+        // reaped from the index, new key added, no re-extraction.
+        let (db_dir, db) = tmp_db();
+        let root = tempfile::tempdir().unwrap();
+        let f = root.path().join("old.txt");
+        std::fs::write(&f, b"renamed content here").unwrap();
+        let h = crate::hash::hash_file(&f).unwrap();
+        journal::upsert(
+            &db,
+            "old.txt",
+            &JournalEntry {
+                blake3: h,
+                size: 21,
+                mtime_millis: 1,
+                remote_version: None,
+            },
+        )
+        .unwrap();
+        let idx_dir = db_dir.path().join("idx");
+        let indexer = Indexer::open(db.clone(), root.path().to_path_buf(), &idx_dir).unwrap();
+        indexer.sweep().await.unwrap();
+        assert_eq!(indexer.search("renamed", 5).unwrap()[0].key, "old.txt");
+        // Rename in the journal: old key gone, new key added, same hash.
+        journal::remove(&db, "old.txt").unwrap();
+        journal::upsert(
+            &db,
+            "new.txt",
+            &JournalEntry {
+                blake3: h,
+                size: 21,
+                mtime_millis: 1,
+                remote_version: None,
+            },
+        )
+        .unwrap();
+        indexer.sweep().await.unwrap();
+        let hits = indexer.search("renamed", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "new.txt");
     }
 }

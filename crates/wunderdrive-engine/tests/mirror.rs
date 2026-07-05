@@ -22,6 +22,7 @@ fn cfg(root: &std::path::Path) -> Config {
         local_root: root.to_path_buf(),
         remote_poll_secs: 3600,
         local_rescan_secs: 3600,
+        lazy: false,
     }
 }
 
