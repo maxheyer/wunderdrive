@@ -18,7 +18,7 @@ GUI is a thin client over the existing IPC protocol.
 - [x] index.rs: Tantivy 0.24 wrapper, 1-edit fuzzy, snippet generator
 - [x] Extraction cache (redb EXTRACT_TABLE), background sweep, search protocol
 
-### Phase 2b: Lazy download + stale index fix (uncommitted, 43 tests green)
+### Phase 2b: Lazy download + stale index fix (commit `170aba6`)
 - [x] config.rs: `lazy: bool` (default true)
 - [x] journal.rs: STUB_TABLE, INDEXED_TABLE, extract_clear()
 - [x] reconcile.rs: RecordStub + Dematerialize actions, 5-param decide()
@@ -48,98 +48,93 @@ GUI is a thin client over the existing IPC protocol.
 
 ---
 
-# Desktop Client — Tauri 2 + React
+# Desktop Client — iced 0.14
 
 ## Locked decisions
 - **TUI**: removed entirely (crate deleted)
 - **Architecture**: daemon + GUI client. Daemon serves IPC over local socket;
-  Tauri app connects as a client
-- **Daemon lifecycle**: Tauri spawns the daemon internally (refactor daemon
-  into a lib + binary so Tauri runs it in a background thread). Single-app UX.
-- **Shell**: Tauri 2 (same as Spacedrive — native webview, small binary)
-- **Frontend**: React 19 + TypeScript + Vite
-- **Styling**: Tailwind CSS v4 + shadcn/ui (Radix-based, MIT, accessible)
-- **Data layer**: TanStack Query (caching, optimistic updates, background refetch)
-- **Virtualization**: @tanstack/react-virtual (100k+ files at 60fps)
-- **Animations**: Framer Motion
-- **Type bridge**: Specta + tauri-specta (auto-generate TS types from Rust wire types)
-- **MVP features**: file browser (grid+list), full-text search, sync status + controls,
-  materialize (lazy download), conflict resolution, quick preview
+  iced app connects as a client (same IPC the TUI used).
+- **Daemon lifecycle**: GUI spawns the existing `wunderdrive-daemon` binary as
+  a child process on startup if the socket isn't already live. No daemon lib
+  refactor — `std::process::Command::spawn`. If daemon already running, just
+  connect. Users get single-app UX; headless daemon still works standalone.
+- **GUI framework**: iced 0.14 (Elm architecture, pure Rust, wgpu backend).
+  Chosen because COSMIC Files (System76's production OS file manager) ships on
+  iced — same domain as wunderdrive. Retained mode → proper virtualized
+  scrolling for large dirs. No DSL, no JS/TS, no web frontend.
+- **Type bridge**: none needed — Rust end-to-end. GUI crate depends on
+  `wunderdrive-engine` and reuses `protocol` types directly.
+- **Theming**: iced built-in `Theme::Dark` (default). Custom palette later.
+- **Icons**: unicode glyphs for status (✓ ↑ + ☁ !) — zero deps. SVG later if
+  needed via `iced::widget::svg`.
+- **MVP features**: file browser (list+grid), full-text search, sync status +
+  controls, materialize (lazy download), conflict resolution, quick preview.
 
 ## Architecture
 ```
 wunderdrive/
 ├── crates/
 │   ├── wunderdrive-engine/     # Core (unchanged)
-│   └── wunderdrive-daemon/     # lib.rs (start_daemon) + main.rs (binary)
-├── apps/
-│   └── desktop/                # NEW — Tauri 2 app
-│       ├── src/                # React frontend
-│       │   ├── components/     # FileGrid, SearchBar, SyncStatus, etc.
-│       │   ├── hooks/          # useSnapshot, useSearch, useMaterialize
-│       │   ├── lib/            # daemon client wrapper
-│       │   └── App.tsx
-│       ├── src-tauri/
-│       │   └── src/            # main.rs, ipc.rs (socket client), commands.rs
-│       ├── package.json
-│       └── tailwind.config.ts
-└── packages/
-    └── ts-types/               # Specta-generated TypeScript types
+│   ├── wunderdrive-daemon/     # Binary (unchanged) — spawned by GUI
+│   └── wunderdrive-gui/        # NEW — iced app
+│       └── src/
+│           ├── main.rs         # Entry: spawn daemon child, iced::run
+│           ├── ipc.rs          # Socket client (reuses engine protocol types)
+│           └── app.rs          # State, Message, update, view
 ```
 
-Data flow: `React → Tauri command → Unix socket → daemon → Engine`
+Data flow: `iced Subscription (1Hz poll) → Unix socket → daemon → Engine`
+Commands (sync/pause/materialize) → `Task` → IPC request → daemon.
 
 ## Sub-phases (each ships a working app)
 
-### 3a. Scaffold (~2h)
-- [ ] Delete `crates/wunderdrive-tui/`, update workspace Cargo.toml
-- [ ] Refactor `wunderdrive-daemon` into `lib.rs` (`start_daemon(socket, engine)`)
-  + thin `main.rs` binary
-- [ ] Add Specta `#[derive(Type)]` to engine wire types (Snapshot, Status,
-  SearchHit, FileStat, FileStatus, ActivityEntry, Resolution)
-- [ ] `cargo create-tauri-app` → `apps/desktop/` with React + TS template
-- [ ] Tauri Rust backend: spawn daemon thread on startup, connect socket
-- [ ] NixOS `flake.nix` (webkit2gtk_4_1, gtk3, nodejs, bun, cargo)
-- [ ] Minimal "connected to daemon" screen — app boots, daemon health check
-- [ ] cargo fmt + test still green
+### 3a. Scaffold (~1h) ✅
+- [x] Delete `crates/wunderdrive-tui/`, update workspace Cargo.toml
+- [x] Create `crates/wunderdrive-gui/` with iced 0.14 dep
+- [x] `ipc.rs`: async socket client — `fetch_status` with retry + daemon
+      auto-spawn. Reuses `wunderdrive_engine::protocol` types.
+- [x] `main.rs`: iced app entrypoint — boots window, fetches status on startup
+- [x] `app.rs`: state = Connecting → Connected(status) | Error(String);
+      view shows bucket/endpoint/local root/paused
+- [x] cargo fmt + test green (4 tests pass, 0 warnings)
+- Note: GUI can't boot in sandbox (missing libwayland-client.so); works on
+      real desktop with Wayland/X11 libs present.
 
 ### 3b. File browser (~3h)
-- [ ] `useSnapshot()` hook (TanStack Query, 10Hz poll or event-driven)
-- [ ] Virtualized file grid (@tanstack/react-virtual)
-- [ ] Virtualized file list (toggle grid/list)
-- [ ] Status icons (synced ✓, uploading ↑, new +, remote-only ☁, conflict !)
-- [ ] Sort by name / size / mtime
-- [ ] Path breadcrumb (navigate subdirectories)
+- [ ] Subscription: poll METHOD_SNAPSHOT every 1s, emit SnapshotFetched
+- [ ] Current-directory view: filter snapshot by path prefix
+- [ ] Scrollable list (iced `scrollable` + `column`) of file rows
+- [ ] Status glyphs per row: ✓ synced, ↑ uploading, + new, ☁ remote-only,
+      ! conflict
+- [ ] Sort by name / size / mtime (column header click)
+- [ ] Path breadcrumb (navigate into/out of subdirs)
 
 ### 3c. Search + sync (~3h)
-- [ ] Search bar (always visible, 150ms debounce)
-- [ ] Live results dropdown (snippet + highlighted match)
-- [ ] Dedicated search results view (Enter)
-- [ ] Sync status bar (endpoint, bucket, last sync, paused)
-- [ ] Pause/Resume button
-- [ ] Sync Now button
-- [ ] Activity feed (streaming via Tauri event channel)
+- [ ] Search bar (text_input, 150ms debounce via Subscription time throttle)
+- [ ] Live results dropdown (METHOD_SEARCH, show snippet + key)
+- [ ] Dedicated search results view (Enter → full-width list)
+- [ ] Sync status bar (endpoint, bucket, last sync, paused indicator)
+- [ ] Pause/Resume + Sync Now buttons (METHOD_PAUSE/RESUME/SYNC_NOW)
+- [ ] Activity feed (poll METHOD_ACTIVITY, scrolling log)
 
 ### 3d. Lazy + conflicts (~2h)
-- [ ] Materialize flow (click cloud icon → progress → synced)
-- [ ] Conflict badge / count in sidebar
-- [ ] Conflict view: local vs remote side-by-side
-- [ ] Keep Local / Keep Remote / Keep Both buttons
+- [ ] Click ☁ glyph → METHOD_MATERIALIZE → row flips to ↑ then ✓
+- [ ] Conflict count badge in sidebar (count ! rows in snapshot)
+- [ ] Conflict view: list conflicts, Keep Local / Keep Remote / Keep Both
+      buttons (METHOD_RESOLVE_CONFLICT)
 
 ### 3e. Quick preview (~3h)
-- [ ] Preview pane (right side or modal)
-- [ ] Text/code: syntax highlighting (Shiki)
-- [ ] Images: direct render from local mirror
-- [ ] PDF: pdf.js viewer
-- [ ] Other: metadata card (size, hash, status, mtime)
+- [ ] Preview pane (right column, toggled)
+- [ ] Text/code: read from local mirror, show in scrollable text widget
+- [ ] Images: `iced::widget::image` from local mirror path
+- [ ] Other: metadata card (size, blake3, status, mtime)
 
 ### 3f. Polish (~3h)
-- [ ] Dark mode (default) + light mode toggle
-- [ ] Smooth transitions (Framer Motion: layout, enter/exit)
-- [ ] Responsive layout (resize handles, min widths)
-- [ ] Keyboard shortcuts (j/k navigate, / search, space preview, etc.)
+- [ ] Custom dark theme palette (iced `Theme` customization)
+- [ ] Keyboard shortcuts (j/k navigate, / focus search, space preview, etc.)
 - [ ] App icon + window title
-- [ ] Loading states + error boundaries
+- [ ] Loading/empty/error states
+- [ ] Grid view (icons + names) vs list view toggle
 
 ## Review
 (filled in after each sub-phase)

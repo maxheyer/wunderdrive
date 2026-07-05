@@ -1,0 +1,16 @@
+[package]
+name = "wunderdrive-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wunderdrive-engine = { path = "../wunderdrive-engine" }
+iced = { workspace = true }
+tokio = { workspace = true }
+interprocess = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+anyhow = { workspace = true }
+tracing = { workspace = true }

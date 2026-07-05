@@ -1,11 +1,6 @@
-/target
-**/*.rs.bk
+# Rust build artifacts
+target/
 
-# local dev artifacts
-*.redb
-docker-compose.minio.override.yml
-
-# editor / OS
-.idea/
-.vscode/
-.DS_Store
+# Nix detritus
+.direnv/
+result

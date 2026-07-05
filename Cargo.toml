@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/wunderdrive-engine",
     "crates/wunderdrive-daemon",
-    "crates/wunderdrive-tui",
+    "crates/wunderdrive-gui",
 ]
 
 [workspace.package]
@@ -36,9 +36,8 @@ dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 # IPC
 interprocess = { version = "2.4", features = ["tokio"] }
-# TUI
-ratatui = "0.30"
-crossterm = { version = "0.29", features = ["event-stream"] }
+# GUI
+iced = { version = "0.14", features = ["tokio"] }
 # Extraction + search (spec §6)
 tantivy = "0.24"
 lopdf = "0.34"
