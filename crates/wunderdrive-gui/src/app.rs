@@ -3,9 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use iced::keyboard::{self, key::Named, Key};
-use iced::widget::{
-    button, column, container, row, scrollable, space::Space, text, text_input, Grid,
-};
+use iced::widget::{button, column, container, row, scrollable, space::Space, text, text_input};
 use iced::{Alignment, Element, Length, Subscription, Task};
 use wunderdrive_engine::protocol::Resolution;
 use wunderdrive_engine::{FileStat, FileStatus, SearchHit, Snapshot, Status};
@@ -925,6 +923,7 @@ fn conflicts_screen(c: &Conn) -> Element<'_, Message> {
             f.key.clone(),
             f.key.clone(),
             f.size,
+            f.mtime_millis,
             f.status,
             is_expanded,
             false,
@@ -1012,16 +1011,18 @@ fn file_list_view(
     }
 
     if view_mode == ViewMode::Grid {
-        let mut g = Grid::new().fluid(120.0).spacing(8);
+        let mut wrap_row = row![].spacing(8);
         for (i, name) in folders.iter().enumerate() {
-            g = g.push(grid_cell(name, cursor == Some(i)));
+            wrap_row = wrap_row.push(grid_cell(name, cursor == Some(i)));
         }
         for (i, f) in files.iter().enumerate() {
             let display = f.key[path.len()..].to_string();
             let selected = cursor == Some(n_folders + i);
-            g = g.push(file_grid_cell(f.key.clone(), display, f.status, selected));
+            wrap_row = wrap_row.push(file_grid_cell(f.key.clone(), display, f.status, selected));
         }
-        list = list.push(g).padding([8, 0]);
+        list = list
+            .push(wrap_row.wrap().vertical_spacing(8))
+            .padding([8, 8]);
     } else {
         for (i, name) in folders.iter().enumerate() {
             list = list.push(folder_row(name, cursor == Some(i)));
@@ -1034,6 +1035,7 @@ fn file_list_view(
                 f.key.clone(),
                 display,
                 f.size,
+                f.mtime_millis,
                 f.status,
                 is_expanded,
                 selected,
@@ -1048,6 +1050,7 @@ fn folder_row(name: &str, selected: bool) -> Element<'static, Message> {
     let display = name.trim_end_matches('/');
     button(
         row![
+            Space::new().width(Length::Fixed(20.0)),
             icons::folder(theme::ACCENT_TEXT),
             text(display.to_string())
                 .size(13)
@@ -1060,7 +1063,8 @@ fn folder_row(name: &str, selected: bool) -> Element<'static, Message> {
     )
     .on_press(Message::Open(name.to_string()))
     .width(Length::Fill)
-    .padding([6, 12])
+    .height(Length::Fixed(40.0))
+    .padding([0, 12])
     .style(if selected {
         theme::selected_row_button
     } else {
@@ -1078,12 +1082,13 @@ fn grid_cell(name: &str, selected: bool) -> Element<'static, Message> {
                 .size(11)
                 .color(theme::TEXT_PRIMARY),
         ]
-        .spacing(6)
+        .spacing(8)
         .align_x(Alignment::Center),
     )
     .on_press(Message::Open(name.to_string()))
-    .width(Length::Fill)
-    .padding([12, 8])
+    .width(Length::Fixed(132.0))
+    .height(Length::Fixed(132.0))
+    .padding([16, 8])
     .style(if selected {
         theme::grid_cell_button_selected
     } else {
@@ -1101,15 +1106,16 @@ fn file_grid_cell(
     let (glyph, color) = status_glyph_icon(status);
     let mut btn = button(
         column![
-            icons::type_icon(&key, theme::TEXT_SECONDARY, 32.0),
+            icons::type_icon(&key, theme::TEXT_SECONDARY, 48.0),
             text(name).size(11).color(theme::TEXT_PRIMARY),
             glyph(color),
         ]
-        .spacing(6)
+        .spacing(8)
         .align_x(Alignment::Center),
     )
-    .width(Length::Fill)
-    .padding([12, 8])
+    .width(Length::Fixed(132.0))
+    .height(Length::Fixed(132.0))
+    .padding([16, 8])
     .style(if selected {
         theme::grid_cell_button_selected
     } else {
@@ -1127,6 +1133,7 @@ fn file_row(
     key: String,
     name: String,
     size: u64,
+    mtime: u64,
     status: FileStatus,
     conflict_expanded: bool,
     selected: bool,
@@ -1135,13 +1142,13 @@ fn file_row(
     let size_text = if status == FileStatus::RemoteOnly {
         "remote".to_string()
     } else {
-        human_size(size)
+        format!("{} \u{00B7} {}", human_size(size), short_date(mtime))
     };
 
     let mut row_btn = button(
         row![
             glyph_fn(glyph_color),
-            icons::type_icon(&key, theme::TEXT_SECONDARY, 16.0),
+            icons::type_icon(&key, theme::TEXT_SECONDARY, 20.0),
             text(name)
                 .size(13)
                 .color(theme::TEXT_PRIMARY)
@@ -1155,12 +1162,15 @@ fn file_row(
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .padding([6, 12])
-    .style(if selected {
+    .height(Length::Fixed(40.0))
+    .padding([0, 12]);
+
+    let style_fn = if selected {
         theme::selected_row_button
     } else {
         theme::row_button
-    });
+    };
+    row_btn = row_btn.style(style_fn);
 
     match status {
         FileStatus::RemoteOnly => {
@@ -1182,9 +1192,36 @@ fn file_row(
         ]
         .spacing(6)
         .padding(iced::Padding::new(0.0).left(38.0).right(12.0).bottom(6.0));
-        column![row_btn, actions].spacing(1).into()
+        column![conflict_edge(row_btn.into()), actions]
+            .spacing(1)
+            .into()
+    } else if status == FileStatus::Conflict {
+        conflict_edge(row_btn.into()).into()
     } else {
         row_btn.into()
+    }
+}
+
+/// Wraps a row button with a 2px amber left edge for conflict rows.
+fn conflict_edge(content: Element<'static, Message>) -> Element<'static, Message> {
+    row![
+        container(Space::new().width(Length::Fixed(2.0)).height(Length::Fill))
+            .style(conflict_bar_style)
+            .height(Length::Fill),
+        container(content).width(Length::Fill),
+    ]
+    .spacing(0)
+    .width(Length::Fill)
+    .into()
+}
+
+fn conflict_bar_style(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(theme::SYNC_CONFLICT)),
+        text_color: None,
+        border: iced::Border::default(),
+        shadow: Default::default(),
+        snap: true,
     }
 }
 
@@ -1373,6 +1410,12 @@ fn load_preview(local_root: String, key: String) -> Task<Message> {
         },
         |(key, content)| Message::PreviewLoaded(key, content),
     )
+}
+
+fn short_date(mtime_millis: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(mtime_millis as i64)
+        .map(|d| d.format("%-d %b").to_string())
+        .unwrap_or_else(|| "?".into())
 }
 
 fn human_size(bytes: u64) -> String {

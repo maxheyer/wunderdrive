@@ -332,6 +332,20 @@ pub fn card_container(_theme: &Theme) -> container::Style {
     }
 }
 
+pub fn conflict_edge_container(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: None,
+        text_color: None,
+        border: Border {
+            color: SYNC_CONFLICT,
+            width: 0.0,
+            radius: border::radius(0.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
 // ---- Text input style ----
 
 pub fn borderless_input(_theme: &Theme, _status: text_input::Status) -> text_input::Style {
