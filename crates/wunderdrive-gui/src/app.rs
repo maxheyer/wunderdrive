@@ -43,6 +43,8 @@ struct Conn {
     status: Status,
     snapshot: Snapshot,
     path: String,
+    nav_history: Vec<String>,
+    nav_future: Vec<String>,
     search_query: String,
     search_hits: Vec<SearchHit>,
     last_error: Option<String>,
@@ -86,6 +88,8 @@ pub enum Message {
     SelectFile(String),
     FocusSearch,
     Navigate(Screen),
+    NavigateBack,
+    NavigateForward,
     Escape,
     Backspace,
     MoveCursor(i32),
@@ -113,7 +117,8 @@ pub fn new() -> (App, Task<Message>) {
 pub fn subscription(_state: &App) -> Subscription<Message> {
     let ticks = iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::Tick);
     let keys = keyboard::listen().filter_map(map_key);
-    Subscription::batch(vec![ticks, keys])
+    let mouse = iced::event::listen_with(map_mouse);
+    Subscription::batch(vec![ticks, keys, mouse])
 }
 
 pub fn update(state: &mut App, msg: Message) -> Task<Message> {
@@ -123,6 +128,8 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 status,
                 snapshot: Snapshot::default(),
                 path: String::new(),
+                nav_history: Vec::new(),
+                nav_future: Vec::new(),
                 search_query: String::new(),
                 search_hits: Vec::new(),
                 last_error: None,
@@ -173,6 +180,8 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
         Message::Open(name) => {
             if let AppState::Connected(c) = &mut state.state {
                 if name.ends_with('/') {
+                    c.nav_history.push(c.path.clone());
+                    c.nav_future.clear();
                     c.path.push_str(&name);
                     c.cursor = None;
                     c.selected = None;
@@ -183,13 +192,39 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
         }
         Message::NavigateUp => {
             if let AppState::Connected(c) = &mut state.state {
-                if let Some(idx) = c.path.trim_end_matches('/').rfind('/') {
-                    c.path.truncate(idx + 1);
-                } else {
-                    c.path.clear();
+                if !c.path.is_empty() {
+                    c.nav_history.push(c.path.clone());
+                    c.nav_future.clear();
+                    if let Some(idx) = c.path.trim_end_matches('/').rfind('/') {
+                        c.path.truncate(idx + 1);
+                    } else {
+                        c.path.clear();
+                    }
+                    c.cursor = None;
+                    c.selected = None;
                 }
-                c.cursor = None;
-                c.selected = None;
+            }
+            Task::none()
+        }
+        Message::NavigateBack => {
+            if let AppState::Connected(c) = &mut state.state {
+                if let Some(prev) = c.nav_history.pop() {
+                    c.nav_future.push(c.path.clone());
+                    c.path = prev;
+                    c.cursor = None;
+                    c.selected = None;
+                }
+            }
+            Task::none()
+        }
+        Message::NavigateForward => {
+            if let AppState::Connected(c) = &mut state.state {
+                if let Some(next) = c.nav_future.pop() {
+                    c.nav_history.push(c.path.clone());
+                    c.path = next;
+                    c.cursor = None;
+                    c.selected = None;
+                }
             }
             Task::none()
         }
@@ -1148,7 +1183,7 @@ fn file_list_view(
 ) -> Element<'static, Message> {
     let n_folders = folders.len();
 
-    let mut list = column![].spacing(1).padding([4, 8]);
+    let mut list = column![].spacing(2).padding([6, 10]);
 
     if !path.is_empty() {
         list = list.push(
@@ -1206,21 +1241,21 @@ fn folder_row(name: &str, selected: bool) -> Element<'static, Message> {
     let display = name.trim_end_matches('/');
     button(
         row![
-            Space::new().width(Length::Fixed(20.0)),
+            Space::new().width(Length::Fixed(24.0)),
             icons::folder(theme::ACCENT_TEXT),
             text(display.to_string())
-                .size(13)
+                .size(15)
                 .color(theme::TEXT_PRIMARY)
                 .width(Length::Fill),
             icons::chevron_right(theme::TEXT_TERTIARY),
         ]
-        .spacing(8)
+        .spacing(12)
         .align_y(Alignment::Center),
     )
     .on_press(Message::Open(name.to_string()))
     .width(Length::Fill)
-    .height(Length::Fixed(40.0))
-    .padding([0, 12])
+    .height(Length::Fixed(48.0))
+    .padding([0, 16])
     .style(if selected {
         theme::selected_row_button
     } else {
@@ -1235,16 +1270,16 @@ fn grid_cell(name: &str, selected: bool) -> Element<'static, Message> {
         column![
             icons::folder(theme::ACCENT_TEXT),
             text(display.to_string())
-                .size(11)
+                .size(12)
                 .color(theme::TEXT_PRIMARY),
         ]
-        .spacing(8)
+        .spacing(10)
         .align_x(Alignment::Center),
     )
     .on_press(Message::Open(name.to_string()))
-    .width(Length::Fixed(132.0))
-    .height(Length::Fixed(132.0))
-    .padding([16, 8])
+    .width(Length::Fixed(152.0))
+    .height(Length::Fixed(152.0))
+    .padding([20, 10])
     .style(if selected {
         theme::grid_cell_button_selected
     } else {
@@ -1262,16 +1297,16 @@ fn file_grid_cell(
     let (glyph, color) = status_glyph_icon(status);
     let mut btn = button(
         column![
-            icons::type_icon(&key, theme::TEXT_SECONDARY, 48.0),
-            text(name).size(11).color(theme::TEXT_PRIMARY),
+            icons::type_icon(&key, theme::TEXT_SECONDARY, 56.0),
+            text(name).size(12).color(theme::TEXT_PRIMARY),
             glyph(color),
         ]
-        .spacing(8)
+        .spacing(10)
         .align_x(Alignment::Center),
     )
-    .width(Length::Fixed(132.0))
-    .height(Length::Fixed(132.0))
-    .padding([16, 8])
+    .width(Length::Fixed(152.0))
+    .height(Length::Fixed(152.0))
+    .padding([20, 10])
     .style(if selected {
         theme::grid_cell_button_selected
     } else {
@@ -1304,22 +1339,22 @@ fn file_row(
     let mut row_btn = button(
         row![
             glyph_fn(glyph_color),
-            icons::type_icon(&key, theme::TEXT_SECONDARY, 20.0),
+            icons::type_icon(&key, theme::TEXT_SECONDARY, 22.0),
             text(name)
-                .size(13)
+                .size(15)
                 .color(theme::TEXT_PRIMARY)
                 .width(Length::Fill),
             text(size_text)
-                .size(11)
+                .size(12)
                 .font(theme::mono_font())
                 .color(theme::TEXT_TERTIARY),
         ]
-        .spacing(8)
+        .spacing(12)
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .height(Length::Fixed(40.0))
-    .padding([0, 12]);
+    .height(Length::Fixed(48.0))
+    .padding([0, 16]);
 
     let style_fn = if selected {
         theme::selected_row_button
@@ -1573,6 +1608,21 @@ fn activate_cursor(c: &Conn) -> Option<Task<Message>> {
     }
 }
 
+fn map_mouse(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    let iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) = event else {
+        return None;
+    };
+    match button {
+        iced::mouse::Button::Back => Some(Message::NavigateBack),
+        iced::mouse::Button::Forward => Some(Message::NavigateForward),
+        _ => None,
+    }
+}
+
 fn map_key(event: keyboard::Event) -> Option<Message> {
     let keyboard::Event::KeyPressed {
         key,
@@ -1589,7 +1639,16 @@ fn map_key(event: keyboard::Event) -> Option<Message> {
         return Some(Message::FocusSearch);
     }
 
-    if modifiers.control() || modifiers.command() || modifiers.alt() {
+    // Alt+Left / Alt+Right for back/forward navigation.
+    if modifiers.alt() {
+        return match key {
+            Key::Named(Named::ArrowLeft) => Some(Message::NavigateBack),
+            Key::Named(Named::ArrowRight) => Some(Message::NavigateForward),
+            _ => None,
+        };
+    }
+
+    if modifiers.control() || modifiers.command() {
         return None;
     }
     match key {
