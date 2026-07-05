@@ -7,11 +7,11 @@ use interprocess::local_socket::{GenericNamespaced, ToNsName};
 use serde::de::DeserializeOwned;
 use tokio::io::BufStream;
 use wunderdrive_engine::protocol::{
-    read_msg, write_msg, Request, Resolution, Response, METHOD_MATERIALIZE, METHOD_PAUSE,
-    METHOD_RESOLVE_CONFLICT, METHOD_RESUME, METHOD_SEARCH, METHOD_SNAPSHOT, METHOD_STATUS,
-    METHOD_SYNC_NOW,
+    read_msg, write_msg, Request, Resolution, Response, METHOD_ACTIVITY, METHOD_MATERIALIZE,
+    METHOD_PAUSE, METHOD_RESOLVE_CONFLICT, METHOD_RESUME, METHOD_SEARCH, METHOD_SNAPSHOT,
+    METHOD_STATUS, METHOD_SYNC_NOW,
 };
-use wunderdrive_engine::{SearchHit, Snapshot, Status};
+use wunderdrive_engine::{ActivityEntry, SearchHit, Snapshot, Status};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -93,6 +93,14 @@ pub async fn resolve_conflict(
         .context("daemon not running")?;
     let params = serde_json::json!({ "key": key, "resolution": resolution });
     request_with_params(&mut stream, METHOD_RESOLVE_CONFLICT, params).await
+}
+
+/// Fetch recent activity log entries.
+pub async fn fetch_activity(socket_name: String) -> Result<Vec<ActivityEntry>> {
+    let mut stream = try_connect(&socket_name)
+        .await
+        .context("daemon not running")?;
+    request_with_params(&mut stream, METHOD_ACTIVITY, serde_json::Value::Null).await
 }
 
 async fn try_connect(socket_name: &str) -> Option<BufStream<Stream>> {

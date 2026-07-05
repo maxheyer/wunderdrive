@@ -6,7 +6,7 @@ use iced::keyboard::{self, key::Named, Key};
 use iced::widget::{button, column, container, row, scrollable, space::Space, text, text_input};
 use iced::{Alignment, Element, Length, Subscription, Task};
 use wunderdrive_engine::protocol::Resolution;
-use wunderdrive_engine::{FileStat, FileStatus, SearchHit, Snapshot, Status};
+use wunderdrive_engine::{ActivityEntry, FileStat, FileStatus, SearchHit, Snapshot, Status};
 
 use crate::{icons, ipc, theme};
 
@@ -35,6 +35,7 @@ pub enum Screen {
     Search,
     Conflicts,
     Activity,
+    Settings,
 }
 
 struct Conn {
@@ -51,6 +52,7 @@ struct Conn {
     cursor: Option<usize>,
     first_snapshot: bool,
     screen: Screen,
+    activity: Vec<ActivityEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +93,7 @@ pub enum Message {
     ActivateCursor,
     ToggleViewMode,
     ActionResult(Result<(), String>),
+    ActivityFetched(Vec<ActivityEntry>),
     FontLoaded,
 }
 
@@ -128,6 +131,7 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 cursor: None,
                 first_snapshot: true,
                 screen: Screen::Files,
+                activity: Vec::new(),
             });
             poll_snapshot()
         }
@@ -277,6 +281,14 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 if screen == Screen::Search {
                     return iced::widget::operation::focus(SEARCH_ID);
                 }
+                if screen == Screen::Activity || screen == Screen::Overview {
+                    return Task::perform(ipc::fetch_activity(SOCKET.into()), |r| {
+                        Message::ActivityFetched(match r {
+                            Ok(v) => v,
+                            Err(_) => Vec::new(),
+                        })
+                    });
+                }
             }
             Task::none()
         }
@@ -344,6 +356,12 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
             tracing::warn!("action failed: {e}");
             if let AppState::Connected(c) = &mut state.state {
                 c.last_error = Some(e);
+            }
+            Task::none()
+        }
+        Message::ActivityFetched(entries) => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.activity = entries;
             }
             Task::none()
         }
@@ -442,7 +460,7 @@ fn sidebar(c: &Conn) -> Element<'_, Message> {
         .spacing(10)
         .align_y(Alignment::Center),
     )
-    .on_press(Message::Navigate(Screen::Overview))
+    .on_press(Message::Navigate(Screen::Settings))
     .width(Length::Fill)
     .padding([6, 8])
     .style(theme::subtle_button);
@@ -506,6 +524,7 @@ fn nav_item(
         Screen::Search => icons::search(icon_color),
         Screen::Conflicts => icons::alert_triangle(icon_color),
         Screen::Activity => icons::refresh_cw(icon_color),
+        Screen::Settings => icons::settings(icon_color),
     };
 
     let badge: Option<Element<'static, Message>> = if has_badge {
@@ -635,6 +654,7 @@ fn content(c: &Conn) -> Element<'_, Message> {
         Screen::Overview => overview_screen(c),
         Screen::Conflicts => conflicts_screen(c),
         Screen::Activity => activity_screen(c),
+        Screen::Settings => settings_screen(c),
     };
 
     container(
@@ -813,10 +833,28 @@ fn overview_screen(c: &Conn) -> Element<'_, Message> {
         Space::new().height(Length::Fixed(16.0)),
         sync_card(c),
         last_error,
+        Space::new().height(Length::Fixed(16.0)),
+        text("Recent activity").size(14).color(theme::TEXT_PRIMARY),
+        recent_activity_list(c),
     ]
     .spacing(4)
     .padding(32)
     .into()
+}
+
+fn recent_activity_list(c: &Conn) -> Element<'_, Message> {
+    if c.activity.is_empty() {
+        return text("No recent activity")
+            .size(12)
+            .color(theme::TEXT_TERTIARY)
+            .into();
+    }
+    let show = c.activity.iter().take(5);
+    let mut col = column![].spacing(1);
+    for entry in show {
+        col = col.push(activity_row(entry));
+    }
+    col.into()
 }
 
 fn stat_card(label: &str, value: &str) -> Element<'static, Message> {
@@ -932,9 +970,81 @@ fn conflicts_screen(c: &Conn) -> Element<'_, Message> {
     list.into()
 }
 
-fn activity_screen(_c: &Conn) -> Element<'static, Message> {
-    // TODO(engine): expose activity log via METHOD_ACTIVITY.
-    empty_state_for("Activity", "Recent sync activity will appear here.")
+fn activity_screen(c: &Conn) -> Element<'_, Message> {
+    if c.activity.is_empty() {
+        return empty_state_for("Activity", "Recent sync activity will appear here.");
+    }
+
+    let mut list = column![].spacing(1).padding([4, 8]);
+    for entry in &c.activity {
+        list = list.push(activity_row(entry));
+    }
+    list.into()
+}
+
+fn activity_row(entry: &ActivityEntry) -> Element<'static, Message> {
+    let time = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(entry.ts_millis as i64)
+        .map(|d| d.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "?".into());
+
+    row![
+        text(time)
+            .size(11)
+            .font(theme::mono_font())
+            .color(theme::TEXT_TERTIARY)
+            .width(Length::Fixed(80.0)),
+        text(entry.kind.clone())
+            .size(11)
+            .color(theme::TEXT_SECONDARY)
+            .width(Length::Fixed(100.0)),
+        text(entry.key.clone()).size(12).color(theme::TEXT_PRIMARY),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .padding([4, 12])
+    .into()
+}
+
+fn settings_screen(c: &Conn) -> Element<'_, Message> {
+    let endpoint = c.status.endpoint.clone().unwrap_or_else(|| "—".into());
+    let local_root = if c.status.local_root.is_empty() {
+        "—".to_string()
+    } else {
+        c.status.local_root.clone()
+    };
+
+    column![
+        text("Settings").size(20).color(theme::TEXT_PRIMARY),
+        Space::new().height(Length::Fixed(16.0)),
+        settings_row("Bucket", &c.status.bucket),
+        settings_row("Endpoint", &endpoint),
+        settings_row("Prefix", &c.status.prefix),
+        settings_row("Local root", &local_root),
+        Space::new().height(Length::Fixed(16.0)),
+        text("wunderdrive v0.1.0")
+            .size(11)
+            .color(theme::TEXT_TERTIARY),
+    ]
+    .spacing(4)
+    .padding(32)
+    .into()
+}
+
+fn settings_row(label: &str, value: &str) -> Element<'static, Message> {
+    row![
+        text(label.to_string())
+            .size(12)
+            .color(theme::TEXT_TERTIARY)
+            .width(Length::Fixed(120.0)),
+        text(value.to_string())
+            .size(13)
+            .font(theme::mono_font())
+            .color(theme::TEXT_PRIMARY),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .padding([6, 0])
+    .into()
 }
 
 fn empty_state_for(title: &str, subtitle: &str) -> Element<'static, Message> {
