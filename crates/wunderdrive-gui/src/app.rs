@@ -18,6 +18,19 @@ const SEARCH_ID: iced::widget::Id = iced::widget::Id::new("search");
 const SIDEBAR_WIDTH: f32 = 232.0;
 const TOOLBAR_HEIGHT: f32 = 48.0;
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+static LEFT_DOWN: AtomicBool = AtomicBool::new(false);
+static CURSOR_X: AtomicU32 = AtomicU32::new(0);
+static CURSOR_Y: AtomicU32 = AtomicU32::new(0);
+
+/// Read the last known cursor position captured by the event listener.
+fn last_cursor_pos() -> Point {
+    Point::new(
+        f32::from_bits(CURSOR_X.load(Ordering::Relaxed)),
+        f32::from_bits(CURSOR_Y.load(Ordering::Relaxed)),
+    )
+}
+
 pub struct App {
     state: AppState,
 }
@@ -52,6 +65,8 @@ struct Conn {
     selection: BTreeSet<String>,
     selection_anchor: Option<String>,
     view_mode: ViewMode,
+    sort_by: SortBy,
+    sort_dir: SortDir,
     cursor: Option<usize>,
     first_snapshot: bool,
     screen: Screen,
@@ -63,7 +78,6 @@ struct Conn {
     file_hover: bool,
     clipboard_op: Option<ClipboardEntry>,
     modifiers: Modifiers,
-    cursor_pos: Point,
     press_origin: Option<Point>,
 }
 
@@ -107,9 +121,22 @@ struct Toast {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ViewMode {
+pub enum ViewMode {
     List,
     Grid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortBy {
+    Name,
+    Size,
+    Modified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +145,7 @@ pub enum Message {
     StatusFetched(Option<Status>, Option<String>),
     SnapshotFetched(Option<Snapshot>, Option<String>),
     Open(String),
+    OpenFile(String),
     NavigateUp,
     Retry,
     SearchQuery(String),
@@ -137,6 +165,8 @@ pub enum Message {
     MoveCursor(i32),
     ActivateCursor,
     ToggleViewMode,
+    SetViewMode(ViewMode),
+    SortBy_(SortBy),
     ActionResult(Result<(), String>),
     ActivityFetched(Vec<ActivityEntry>),
     Tick,
@@ -190,11 +220,33 @@ pub fn new() -> (App, Task<Message>) {
     )
 }
 
-pub fn subscription(_state: &App) -> Subscription<Message> {
-    let ticks = iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::Tick);
+pub fn subscription(state: &App) -> Subscription<Message> {
     let keys = keyboard::listen().filter_map(map_key);
     let mouse = iced::event::listen_with(map_event);
-    Subscription::batch(vec![ticks, keys, mouse])
+
+    // Only run the animation tick when something actually needs it:
+    // syncing (rotating glyph) or a toast (auto-dismiss countdown).
+    // Otherwise every 50ms tick forces a full re-view — the context menu
+    // rebuild storm.
+    let need_tick = match &state.state {
+        AppState::Connected(c) => {
+            let syncing = !c.status.paused && c.status.last_sync_millis.is_none();
+            syncing || c.toast.is_some()
+        }
+        _ => false,
+    };
+
+    let ticks = if need_tick {
+        Some(iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::Tick))
+    } else {
+        None
+    };
+
+    let mut subs = vec![keys, mouse];
+    if let Some(t) = ticks {
+        subs.push(t);
+    }
+    Subscription::batch(subs)
 }
 
 pub fn update(state: &mut App, msg: Message) -> Task<Message> {
@@ -213,6 +265,8 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 selection: BTreeSet::new(),
                 selection_anchor: None,
                 view_mode: ViewMode::List,
+                sort_by: SortBy::Name,
+                sort_dir: SortDir::Asc,
                 cursor: None,
                 first_snapshot: true,
                 screen: Screen::Files,
@@ -224,7 +278,6 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 file_hover: false,
                 clipboard_op: None,
                 modifiers: Modifiers::default(),
-                cursor_pos: Point::ORIGIN,
                 press_origin: None,
             });
             poll_snapshot()
@@ -273,6 +326,14 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                     c.context_menu = None;
                     c.screen = Screen::Files;
                 }
+            }
+            Task::none()
+        }
+        Message::OpenFile(key) => {
+            if let AppState::Connected(c) = &mut state.state {
+                let path = std::path::Path::new(&c.status.local_root).join(&key);
+                open_path(&path);
+                c.context_menu = None;
             }
             Task::none()
         }
@@ -470,6 +531,26 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::SetViewMode(mode) => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.view_mode = mode;
+            }
+            Task::none()
+        }
+        Message::SortBy_(by) => {
+            if let AppState::Connected(c) = &mut state.state {
+                if c.sort_by == by {
+                    c.sort_dir = match c.sort_dir {
+                        SortDir::Asc => SortDir::Desc,
+                        SortDir::Desc => SortDir::Asc,
+                    };
+                } else {
+                    c.sort_by = by;
+                    c.sort_dir = SortDir::Asc;
+                }
+            }
+            Task::none()
+        }
         Message::ActionResult(Ok(())) => {
             if let AppState::Connected(c) = &mut state.state {
                 c.last_error = None;
@@ -577,7 +658,6 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
         }
         Message::CursorMoved(pos) => {
             if let AppState::Connected(c) = &mut state.state {
-                c.cursor_pos = pos;
                 // Detect drag threshold: if we have a press_origin and the
                 // cursor moved > 5px, start a drag with the current selection.
                 if let Some(origin) = c.press_origin {
@@ -610,7 +690,7 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                     c.selection_anchor = Some(key.clone());
                 }
                 c.context_menu = Some(ContextMenu {
-                    position: c.cursor_pos,
+                    position: last_cursor_pos(),
                     target: MenuTarget::Item(key),
                 });
             }
@@ -619,7 +699,7 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
         Message::RightClickedBackground => {
             if let AppState::Connected(c) = &mut state.state {
                 c.context_menu = Some(ContextMenu {
-                    position: c.cursor_pos,
+                    position: last_cursor_pos(),
                     target: MenuTarget::FileListBackground,
                 });
             }
@@ -769,7 +849,7 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                         c.selection_anchor = Some(anchor_key);
                     }
                 }
-                c.press_origin = Some(c.cursor_pos);
+                c.press_origin = Some(last_cursor_pos());
                 c.context_menu = None;
             }
             Task::none()
@@ -974,7 +1054,7 @@ fn context_menu_overlay<'a>(menu: &'a ContextMenu, c: &'a Conn) -> Element<'a, M
 
     let items = context_menu_items(&menu.target, c);
 
-    let menu_card = container(column!(items).spacing(1).padding(4))
+    let menu_card = container(column!(items).spacing(2).padding(6))
         .width(Length::Fixed(200.0))
         .style(theme::context_menu_container);
 
@@ -983,13 +1063,10 @@ fn context_menu_overlay<'a>(menu: &'a ContextMenu, c: &'a Conn) -> Element<'a, M
     let positioned = container(menu_card).padding(iced::Padding::new(0.0).top(pos.y).left(pos.x));
 
     // ponytail: stack dismiss layer + positioned menu card
-    stack![
-        dismiss,
-        mouse_area(positioned).on_press(Message::CloseContextMenu),
-    ]
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+    stack![dismiss, positioned,]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 fn context_menu_items<'a>(target: &'a MenuTarget, c: &'a Conn) -> Element<'a, Message> {
@@ -1040,11 +1117,10 @@ fn context_menu_items<'a>(target: &'a MenuTarget, c: &'a Conn) -> Element<'a, Me
                         icons::folder(theme::TEXT_SECONDARY),
                     ));
                 } else {
-                    // TODO(engine): open with system default app
                     col = col.push(menu_item(
                         "Open",
-                        None,
-                        icons::external_link(theme::TEXT_TERTIARY),
+                        Some(Message::OpenFile(key.clone())),
+                        icons::external_link(theme::TEXT_SECONDARY),
                     ));
                 }
             }
@@ -1109,10 +1185,9 @@ fn menu_item(
     ]
     .spacing(10)
     .align_y(Alignment::Center)
-    .padding([6, 10])
     .width(Length::Fill);
 
-    let mut btn = button(content).width(Length::Fill);
+    let mut btn = button(content).width(Length::Fill).padding([8, 12]);
     if let Some(msg) = on_press {
         btn = btn.on_press(msg).style(theme::menu_item_button);
     } else {
@@ -1446,8 +1521,8 @@ fn toolbar(c: &Conn) -> Element<'_, Message> {
         .spacing(8)
         .align_y(Alignment::Center),
     )
-    .padding([10, 16])
-    .height(Length::Fixed(TOOLBAR_HEIGHT + 20.0))
+    .padding([0, 16])
+    .height(Length::Fixed(TOOLBAR_HEIGHT))
     .style(theme::top_bar_container)
     .into()
 }
@@ -1510,7 +1585,8 @@ fn files_body(c: &Conn) -> Element<'_, Message> {
         return search_results_view(&c.search_hits);
     }
 
-    let (folders, files) = split_dirs(&c.snapshot, &c.path);
+    let (folders, mut files) = split_dirs(&c.snapshot, &c.path);
+    sort_files(&mut files, c.sort_by, c.sort_dir);
     let total = folders.len() + files.len();
 
     if total == 0 {
@@ -1526,6 +1602,8 @@ fn files_body(c: &Conn) -> Element<'_, Message> {
         &files,
         c.expanded_conflict.as_deref(),
         c.view_mode,
+        c.sort_by,
+        c.sort_dir,
         c.cursor,
         &c.selection,
         c.modifiers,
@@ -1687,7 +1765,7 @@ fn conflicts_screen(c: &Conn) -> Element<'_, Message> {
         return empty_state_for("No conflicts", "All files are in sync.");
     }
 
-    let mut list = column![].spacing(1).padding([4, 8]);
+    let mut list = column![].spacing(1).padding([8, 0]);
     for f in &conflicts {
         let is_expanded = c.expanded_conflict.as_deref() == Some(f.key.as_str());
         list = list.push(file_row(
@@ -1709,7 +1787,7 @@ fn activity_screen(c: &Conn) -> Element<'_, Message> {
         return empty_state_for("Activity", "Recent sync activity will appear here.");
     }
 
-    let mut list = column![].spacing(1).padding([4, 8]);
+    let mut list = column![].spacing(1).padding([8, 0]);
     for entry in &c.activity {
         list = list.push(activity_row(entry));
     }
@@ -1735,7 +1813,7 @@ fn activity_row(entry: &ActivityEntry) -> Element<'static, Message> {
     ]
     .spacing(8)
     .align_y(Alignment::Center)
-    .padding([4, 12])
+    .padding([6, 16])
     .into()
 }
 
@@ -1798,7 +1876,7 @@ fn search_results_view(hits: &[SearchHit]) -> Element<'static, Message> {
     if hits.is_empty() {
         return centered_text("No matches", 13.0);
     }
-    let mut list = column![].spacing(1).padding([4, 8]);
+    let mut list = column![].spacing(1).padding([8, 0]);
     for h in hits {
         let parent = parent_folder(&h.key);
         list = list.push(search_row(&h.key, h.snippet.as_deref(), parent));
@@ -1821,9 +1899,69 @@ fn search_row(key: &str, snippet: Option<&str>, parent: String) -> Element<'stat
     button(col)
         .on_press(Message::Open(parent))
         .width(Length::Fill)
-        .padding([6, 12])
+        .padding([8, 16])
         .style(theme::row_button)
         .into()
+}
+
+fn column_header(sort_by: SortBy, sort_dir: SortDir) -> Element<'static, Message> {
+    let arrow = if sort_dir == SortDir::Asc {
+        "\u{25B2}" // ▲
+    } else {
+        "\u{25BC}" // ▼
+    };
+    let mk = |label: &str, col: SortBy| -> Element<'static, Message> {
+        let active = sort_by == col;
+        let color = if active {
+            theme::TEXT_SECONDARY
+        } else {
+            theme::TEXT_TERTIARY
+        };
+        let mut r = row![]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .push(text(label.to_string()).size(11).color(color));
+        if active {
+            r = r.push(text(arrow).size(9).color(theme::ACCENT_TEXT));
+        }
+        button(r)
+            .on_press(Message::SortBy_(col))
+            .padding([4, 4])
+            .style(theme::header_button)
+            .into()
+    };
+    // Match file row: padding [0, 16], then glyph(16) + spacing(12) + icon(22) + spacing(12) = 62
+    row![
+        Space::new().width(Length::Fixed(62.0)),
+        mk("Name", SortBy::Name),
+        Space::new().width(Length::Fill),
+        container(mk("Modified", SortBy::Modified))
+            .width(Length::Fixed(90.0))
+            .align_x(iced::alignment::Horizontal::Right),
+        Space::new().width(Length::Fixed(8.0)),
+        container(mk("Size", SortBy::Size))
+            .width(Length::Fixed(70.0))
+            .align_x(iced::alignment::Horizontal::Right),
+    ]
+    .align_y(Alignment::Center)
+    .padding([0, 16])
+    .height(Length::Fixed(28.0))
+    .into()
+}
+
+fn sort_files(files: &mut [&FileStat], by: SortBy, dir: SortDir) {
+    files.sort_by(|a, b| {
+        let ord = match by {
+            SortBy::Name => a.key.cmp(&b.key),
+            SortBy::Size => a.size.cmp(&b.size),
+            SortBy::Modified => a.mtime_millis.cmp(&b.mtime_millis),
+        };
+        if dir == SortDir::Asc {
+            ord
+        } else {
+            ord.reverse()
+        }
+    });
 }
 
 fn file_list_view(
@@ -1832,12 +1970,14 @@ fn file_list_view(
     files: &[&FileStat],
     expanded_conflict: Option<&str>,
     view_mode: ViewMode,
+    sort_by: SortBy,
+    sort_dir: SortDir,
     _cursor: Option<usize>,
     selection: &BTreeSet<String>,
     modifiers: Modifiers,
     dragging: bool,
 ) -> Element<'static, Message> {
-    let mut list = column![].spacing(2).padding([6, 10]);
+    let mut list = column![].spacing(1).padding([8, 0]);
 
     if !path.is_empty() {
         list = list.push(
@@ -1850,7 +1990,7 @@ fn file_list_view(
                 .align_y(Alignment::Center),
             )
             .on_press(Message::NavigateUp)
-            .padding([5, 10])
+            .padding([6, 16])
             .style(theme::subtle_button),
         );
     }
@@ -1876,10 +2016,9 @@ fn file_list_view(
                 modifiers,
             ));
         }
-        list = list
-            .push(wrap_row.wrap().vertical_spacing(8))
-            .padding([8, 8]);
+        list = list.push(wrap_row.wrap().vertical_spacing(8));
     } else {
+        list = list.push(column_header(sort_by, sort_dir));
         for name in folders.iter() {
             list = list.push(folder_row(
                 name,
@@ -1922,10 +2061,11 @@ fn folder_row(
     let display = name.trim_end_matches('/');
     let inner: Element<'static, Message> = button(
         row![
-            Space::new().width(Length::Fixed(24.0)),
+            // Reserve space to align with file rows (sync glyph 16 + spacing 12)
+            Space::new().width(Length::Fixed(16.0)),
             icons::folder(theme::ACCENT_TEXT),
             text(display.to_string())
-                .size(15)
+                .size(14)
                 .color(theme::TEXT_PRIMARY)
                 .width(Length::Fill),
             icons::chevron_right(theme::TEXT_TERTIARY),
@@ -1934,7 +2074,7 @@ fn folder_row(
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .height(Length::Fixed(48.0))
+    .height(Length::Fixed(40.0))
     .padding([0, 16])
     .style(if dragging {
         theme::drop_target_row_button
@@ -1977,7 +2117,7 @@ fn grid_cell(
     )
     .width(Length::Fixed(152.0))
     .height(Length::Fixed(152.0))
-    .padding([20, 10])
+    .padding([24, 12])
     .style(if dragging || selected {
         theme::grid_cell_button_selected
     } else {
@@ -2015,7 +2155,7 @@ fn file_grid_cell(
     )
     .width(Length::Fixed(152.0))
     .height(Length::Fixed(152.0))
-    .padding([20, 10])
+    .padding([24, 12])
     .style(if selected {
         theme::grid_cell_button_selected
     } else {
@@ -2033,6 +2173,8 @@ fn file_grid_cell(
 
     if status == FileStatus::RemoteOnly {
         area = area.on_double_click(Message::Materialize(key_rc3));
+    } else {
+        area = area.on_double_click(Message::OpenFile(key_rc3));
     }
 
     area.into()
@@ -2052,7 +2194,12 @@ fn file_row(
     let size_text = if status == FileStatus::RemoteOnly {
         "remote".to_string()
     } else {
-        format!("{} \u{00B7} {}", human_size(size), short_date(mtime))
+        human_size(size)
+    };
+    let date_text = if status == FileStatus::RemoteOnly {
+        String::new()
+    } else {
+        short_date(mtime)
     };
 
     let inner: Element<'static, Message> = button(
@@ -2060,19 +2207,27 @@ fn file_row(
             glyph_fn(glyph_color),
             icons::type_icon(&key, theme::TEXT_SECONDARY, 22.0),
             text(name)
-                .size(15)
+                .size(14)
                 .color(theme::TEXT_PRIMARY)
                 .width(Length::Fill),
+            text(date_text)
+                .size(12)
+                .color(theme::TEXT_TERTIARY)
+                .width(Length::Fixed(90.0))
+                .align_x(iced::alignment::Horizontal::Right),
+            Space::new().width(Length::Fixed(8.0)),
             text(size_text)
                 .size(12)
                 .font(theme::mono_font())
-                .color(theme::TEXT_TERTIARY),
+                .color(theme::TEXT_TERTIARY)
+                .width(Length::Fixed(70.0))
+                .align_x(iced::alignment::Horizontal::Right),
         ]
         .spacing(12)
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .height(Length::Fixed(48.0))
+    .height(Length::Fixed(40.0))
     .padding([0, 16])
     .style(if selected {
         theme::selected_row_button
@@ -2093,6 +2248,8 @@ fn file_row(
         area = area.on_double_click(Message::Materialize(key_rc3));
     } else if status == FileStatus::Conflict {
         area = area.on_double_click(Message::ToggleConflict(key_rc3));
+    } else {
+        area = area.on_double_click(Message::OpenFile(key_rc3));
     }
 
     if status == FileStatus::Conflict && conflict_expanded {
@@ -2252,9 +2409,21 @@ fn status_glyph_icon(
 }
 
 fn short_date(mtime_millis: u64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(mtime_millis as i64)
-        .map(|d| d.format("%-d %b").to_string())
-        .unwrap_or_else(|| "?".into())
+    let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(mtime_millis as i64)
+    else {
+        return "?".into();
+    };
+    let now = chrono::Utc::now();
+    let delta = now - dt;
+    if delta.num_days() == 0 {
+        "Today".into()
+    } else if delta.num_days() == -1 {
+        "Yesterday".into()
+    } else if delta.num_days() < 0 {
+        format!("{} days ago", -delta.num_days())
+    } else {
+        dt.format("%-d %b").to_string()
+    }
 }
 
 fn human_size(bytes: u64) -> String {
@@ -2339,7 +2508,7 @@ fn activate_cursor(c: &Conn) -> Option<Task<Message>> {
     let idx = c.cursor?;
     match items.get(idx)? {
         Item::Folder(name) => Some(Task::done(Message::Open(name.clone()))),
-        Item::File(key) => Some(Task::done(Message::SelectFile(key.clone()))),
+        Item::File(key) => Some(Task::done(Message::OpenFile(key.clone()))),
     }
 }
 
@@ -2352,12 +2521,14 @@ fn map_event(
         iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) => match button {
             iced::mouse::Button::Back => Some(Message::NavigateBack),
             iced::mouse::Button::Forward => Some(Message::NavigateForward),
+            iced::mouse::Button::Left => {
+                LEFT_DOWN.store(true, Ordering::Relaxed);
+                None
+            }
             _ => None,
         },
         iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
-            // Only end drag if the release wasn't consumed by a widget
-            // (e.g., folder row's on_release fires first and marks the event
-            // as captured, so we skip the fallback clear).
+            LEFT_DOWN.store(false, Ordering::Relaxed);
             if status == iced::event::Status::Ignored {
                 Some(Message::MouseReleased)
             } else {
@@ -2365,7 +2536,17 @@ fn map_event(
             }
         }
         iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
-            Some(Message::CursorMoved(position))
+            CURSOR_X.store(position.x.to_bits(), Ordering::Relaxed);
+            CURSOR_Y.store(position.y.to_bits(), Ordering::Relaxed);
+            // Only forward cursor movement as a message while the left button
+            // is held (drag tracking). Forwarding every mouse-move would
+            // trigger a full re-view — including any open context menu — on
+            // every pixel of movement.
+            if LEFT_DOWN.load(Ordering::Relaxed) {
+                Some(Message::CursorMoved(position))
+            } else {
+                None
+            }
         }
         iced::Event::Keyboard(keyboard::Event::ModifiersChanged(mods)) => {
             Some(Message::ModifiersChanged(mods))
@@ -2415,6 +2596,8 @@ fn map_key(event: keyboard::Event) -> Option<Message> {
                 "c" => Some(Message::ClipboardCopy),
                 "x" => Some(Message::ClipboardCut),
                 "v" => Some(Message::ClipboardPaste),
+                "1" => Some(Message::SetViewMode(ViewMode::List)),
+                "2" => Some(Message::SetViewMode(ViewMode::Grid)),
                 _ => None,
             },
             _ => None,
@@ -2468,4 +2651,16 @@ fn map_action(r: Result<(), anyhow::Error>) -> Message {
         Ok(()) => Message::ActionResult(Ok(())),
         Err(e) => Message::ActionResult(Err(e.to_string())),
     }
+}
+
+/// Open a file or folder with the OS default handler.
+fn open_path(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let cmd = "xdg-open";
+    #[cfg(target_os = "windows")]
+    let cmd = "explorer";
+
+    let _ = std::process::Command::new(cmd).arg(path).spawn();
 }

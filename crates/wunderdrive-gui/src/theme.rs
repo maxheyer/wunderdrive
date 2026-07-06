@@ -243,6 +243,24 @@ pub fn icon_button(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+pub fn header_button(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered | button::Status::Pressed => BG_HOVER,
+        _ => Color::TRANSPARENT,
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: TEXT_TERTIARY,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: border::radius(4.0),
+        },
+        shadow: Default::default(),
+        snap: true,
+    }
+}
+
 // ---- Container styles ----
 
 pub fn sidebar_container(_theme: &Theme) -> container::Style {
