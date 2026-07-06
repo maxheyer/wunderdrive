@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use iced::keyboard::{self, key::Named, Key, Modifiers};
 use iced::widget::{
-    button, column, container, mouse_area, row, scrollable, space::Space, stack, text, text_input,
+    button, column, container, mouse_area, responsive, row, scrollable, space::Space, stack, text,
+    text_input,
 };
 use iced::{Alignment, Element, Length, Point, Subscription, Task};
 use wunderdrive_engine::protocol::Resolution;
@@ -71,6 +72,7 @@ struct Conn {
     first_snapshot: bool,
     screen: Screen,
     activity: Vec<ActivityEntry>,
+    activity_scroll_y: f32,
     sync_phase: f32,
     toast: Option<Toast>,
     context_menu: Option<ContextMenu>,
@@ -169,6 +171,7 @@ pub enum Message {
     SortBy_(SortBy),
     ActionResult(Result<(), String>),
     ActivityFetched(Vec<ActivityEntry>),
+    ActivityScrolled(f32),
     Tick,
     FontLoaded,
     // Multi-selection
@@ -271,6 +274,7 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
                 first_snapshot: true,
                 screen: Screen::Files,
                 activity: Vec::new(),
+                activity_scroll_y: 0.0,
                 sync_phase: 0.0,
                 toast: None,
                 context_menu: None,
@@ -571,6 +575,13 @@ pub fn update(state: &mut App, msg: Message) -> Task<Message> {
         Message::ActivityFetched(entries) => {
             if let AppState::Connected(c) = &mut state.state {
                 c.activity = entries;
+                c.activity_scroll_y = 0.0;
+            }
+            Task::none()
+        }
+        Message::ActivityScrolled(y) => {
+            if let AppState::Connected(c) = &mut state.state {
+                c.activity_scroll_y = y;
             }
             Task::none()
         }
@@ -1462,18 +1473,20 @@ fn content(c: &Conn) -> Element<'_, Message> {
         Screen::Settings => settings_screen(c),
     };
 
-    container(
-        column![
-            toolbar(c),
-            scrollable(body)
-                .height(Length::Fill)
-                .style(theme::thin_scrollable),
-        ]
-        .height(Length::Fill),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+    let scroll = scrollable(body)
+        .height(Length::Fill)
+        .style(theme::thin_scrollable);
+
+    let scroll = if c.screen == Screen::Activity {
+        scroll.on_scroll(|vp| Message::ActivityScrolled(vp.absolute_offset().y))
+    } else {
+        scroll
+    };
+
+    container(column![toolbar(c), scroll].height(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 /// Toolbar (48px): back · breadcrumb + count · centered search · grid/list toggle.
@@ -1782,16 +1795,52 @@ fn conflicts_screen(c: &Conn) -> Element<'_, Message> {
     list.into()
 }
 
+/// Height of a single activity row in px (6 top + ~16 text + 6 bottom + 1 spacing).
+const ACTIVITY_ROW_H: f32 = 29.0;
+
 fn activity_screen(c: &Conn) -> Element<'_, Message> {
     if c.activity.is_empty() {
         return empty_state_for("Activity", "Recent sync activity will appear here.");
     }
 
-    let mut list = column![].spacing(1).padding([8, 0]);
-    for entry in &c.activity {
-        list = list.push(activity_row(entry));
-    }
-    list.into()
+    let entries = &c.activity;
+    let total = entries.len();
+    let scroll_y = c.activity_scroll_y;
+    let top_pad = 8.0_f32;
+
+    responsive(move |size| {
+        let vh = size.height;
+
+        let first_visible =
+            (((scroll_y - top_pad) / ACTIVITY_ROW_H).floor() as isize).max(0) as usize;
+        let last_visible = ((((scroll_y + vh - top_pad) / ACTIVITY_ROW_H).ceil() as isize).max(0)
+            as usize)
+            .min(total.saturating_sub(1));
+
+        let overscan = 4;
+        let win_start = first_visible.saturating_sub(overscan);
+        let win_end = (last_visible + overscan + 1).min(total);
+
+        let above_h = win_start as f32 * ACTIVITY_ROW_H + top_pad;
+        let below_h = (total - win_end) as f32 * ACTIVITY_ROW_H;
+
+        let mut col = column![].spacing(1);
+
+        if above_h > 0.0 {
+            col = col.push(Space::new().height(Length::Fixed(above_h)));
+        }
+
+        for entry in &entries[win_start..win_end] {
+            col = col.push(activity_row(entry));
+        }
+
+        if below_h > 0.0 {
+            col = col.push(Space::new().height(Length::Fixed(below_h)));
+        }
+
+        col.into()
+    })
+    .into()
 }
 
 fn activity_row(entry: &ActivityEntry) -> Element<'static, Message> {
